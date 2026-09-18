@@ -1,0 +1,628 @@
+<!-- To be compatible with workflowr, we need to specify the absolute directory under which the plots are generated, otherwise they will be saved into figure/<basename>.Rmd/<chunk-name>.<extension. and not visible in the html document: https://github.com/workflowr/workflowr/issues/111 -->
+```{r template-options, include = FALSE}
+library(ggbeeswarm)
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+```
+
+```{r set-gsea-collections}
+gse_collections <- list(
+  GSEA = names(gmt_files_symbols),
+  # gseGO = c("BP"),
+  gseGO = names(gse_list[[1]]$gseGO)
+  # gseKEGG = 'gseKEGG',
+  # gseReactome = 'gseReactome'
+)
+
+```
+
+### Download results
+<!-- Write GSE results to xlsx file -->
+```{r write-gse_list-xlsx}
+# File name summary
+rmd_file <- current_input()
+if(is.null(rmd_file))
+  rmd_file <- 'tmp'
+
+file_xlsx_list <- list()
+for(sr in names(gse_collections)) {
+  file_xlsx_list[[sr]] <- list()
+  for(gc in gse_collections[[sr]]) {
+    # Generate file
+    file_xlsx <- file.path('./docs/file', 
+                           rmd_file, 
+                           paste0('gse_', tolower(sr), '_', tolower(gc), '.xlsx')
+                           )
+    file_xlsx_list[[sr]][[gc]] <- file_xlsx
+    dir.create(dirname(file_xlsx), recursive = TRUE, showWarnings = FALSE)
+    
+    # Generate workbook
+    wb <- createWorkbook()
+    for(i in names(gse_list)) {
+      addWorksheet(wb, i)
+      if(gc != sr){
+        if(!is.null(gse_list[[i]][[sr]][[gc]])) {
+          res <- gse_list[[i]][[sr]][[gc]]@result
+          writeData(wb, i, res)
+        }
+      }
+      if(gc == sr){
+        if(!is.null(gse_list[[i]][[sr]])) {
+          res <- gse_list[[i]][[sr]]@result
+          writeData(wb, i, res)
+        }
+      }
+    }
+    saveWorkbook(wb, file_xlsx, TRUE)
+  }
+}
+```
+
+<!-- Change gse_list names after writing to xlsx -->
+```{r change-gse-names}
+if(exists('comp_list_description')) {
+  comp_names <- comp_list_description$comparison_long %>% 
+    set_names(comp_list_description$comparison)
+  
+  comp_list_backup <- comp_list
+  names_gse_list_backup <- names(gse_list)
+  
+  names(comp_list) <- comp_names[names(comp_list)]
+  names(gse_list) <- comp_names[names(gse_list)]
+}
+```
+
+<!-- Write links to download GSE results -->
+```{r write-links-gse-2, echo = FALSE}
+for(sr in names(file_xlsx_list)) {
+  for(gc in names(file_xlsx_list[[sr]])) {
+    file_xlsx <- gsub("docs/", "", file_xlsx_list[[sr]][[gc]])
+    if(sr == 'GSEA') {
+      cat(paste0("- [**Gene set enrichment analysis: ", gc, "**](", file_xlsx, ")"), '\n\n')
+    }
+    if(sr == 'gseGO') {
+      cat(paste0("- [**Gene set enrichment analysis: GO:", gc, "**](", file_xlsx, ")"), '\n\n')
+    }   
+    if(sr == 'gseKEGG') {
+      cat(paste0("- [**Gene set enrichment analysis: KEGG**](", file_xlsx, ")"), '\n\n')
+    }  
+    if(sr == 'gseReactome') {
+      cat(paste0("- [**Gene set enrichment analysis: Reactome**](", file_xlsx, ")"), '\n\n')
+    }
+  }
+}
+```
+
+### Summary of results
+```{r gse-summary-fdr}
+res <- foreach(i = names(gse_list), .combine = rbind) %do% {
+  foreach(sr = names(gse_collections), .combine = rbind) %do% {
+    
+    foreach(gc = gse_collections[[sr]], .combine = rbind) %do% {
+      if(sr == 'GSEA') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05)
+        # if(gc == 'msigdb.c2.cp') {
+        #   x %<>% 
+        #     filter(grepl('REACTOME|KEGG|WP', ID))
+        # }
+      }
+      if(sr == 'gseGO') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05)
+      }
+      if(sr %in% c('gseKEGG', 'gseReactome')) {
+        x <- gse_list[[i]][[sr]]@result %>% 
+          filter(p.adjust <= 0.05)
+      }
+      c(
+        Comparison = i,
+        `Collection` = gc,
+        `Total` = nrow(x),
+        `Supressed` = x %>% filter(NES < 0) %>% nrow,
+        `Activated` = x %>% filter(NES > 0) %>% nrow
+      )
+    }
+  }
+}
+
+res <- res %>% data.frame(check.names = F)
+
+```
+
+#### Table
+```{r gse-summary-fdr-table}
+res %>% 
+  data.frame(check.names = F) %>% 
+  kbl(caption = 'Number of gene sets at FDR < 0.05',
+              row.names = F) %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), 
+              full_width = F) %>%
+  column_spec(1, bold = TRUE)
+```
+
+#### Barplot
+```{r gse-summary-fdr-barplot, fig.asp = 1.3}
+res %>% 
+  pivot_longer(cols = c('Total', 'Supressed', 'Activated'), names_to = 'Direction', values_to = 'Count') %>% 
+  mutate(
+    comb_names = paste(Comparison, Collection),
+    Count = as.numeric(Count),
+    Comparison = gsub("-over-", " over\n", Comparison),
+    Comparison = gsub(" corrected", "\ncorrected", Comparison)
+    ) %>% 
+  ggplot(aes(Collection, Count, fill = Direction)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  facet_grid(rows = vars(Comparison)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  scale_fill_manual(values = c(Supressed = '#74add1', 
+                               Activated = '#f46d43',
+                               Total = 'grey80')
+                    ) +
+  labs(x = '', fill = '') +
+  theme_facet +
+  theme(
+    axis.line = element_blank(),
+    axis.ticks = element_line(linewidth = one_pt/4, color = 'black'),
+    strip.text = element_text(size = 5)
+    
+  )
+```
+
+### Dotplots
+<!-- # Subchunkify dotplots -->
+<!-- ## chunk options need to be set to echo=FALSE, results='asis' -->
+<!-- ## Cause results='asis',we must use raw HTML to print text and headings -->
+```{r gse-dotplot, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+use_linewidth <- 1/2.141959
+root_section_number <- 6.3
+section_n <- 1
+subsection_n <- 1
+
+for(i in names(gse_list)) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  cat("<h4> <span class=\"header-section-number\">",h_section_number,"</span>Comparison", i, "</h4>\n\n") #Caue results='asis',we must use raw HTML
+  section_n <- section_n + 1
+  for(sr in names(gse_collections)) {
+    for(gc in gse_collections[[sr]]) {
+      if(sr == 'GSEA') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05) %>% 
+          mutate(Description = clean_msigdb_names(Description))
+        # if(gc == 'msigdb.c2.cp') {
+        #   x %<>% 
+        #     filter(grepl('REACTOME|KEGG|WP', ID))
+        # }
+      }
+      if(sr == 'gseGO') {
+        x <- gse_list[[i]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= 0.05 & simplify)
+      }
+      if(sr %in% c('gseKEGG', 'gseReactome')) {
+        x <- gse_list[[i]][[sr]]@result %>% 
+          filter(p.adjust <= 0.05)
+      }
+      if(nrow(x) > 0) {
+        h_subsection_number <- paste(h_section_number, subsection_n, sep=".")
+        cat("<h5> <span class=\"header-section-number\">",h_subsection_number,"</span>Collection", gc, "</h5>\n\n") #Caue results='asis',we must use raw HTML
+        subsection_n <- subsection_n + 1
+        
+        x %<>% 
+          mutate(log10P = -log10(p.adjust)) %>% 
+          arrange(p.adjust) %>% 
+          head(30)
+        
+        res <- gse.dotplot(
+          x,
+          x = 'NES',
+          color = 'NES',
+          size = "log10P",
+          # color2log10 = TRUE,
+          showCategory = 20,
+          label_format = 60
+        ) +
+          geom_vline(xintercept = 0, lty = 3) +
+          scale_size_continuous(range=c(0.3, 2.5)) +
+          scale_color_gradient2(trans = "reverse") +
+          scale_x_continuous(expand = expansion(mult = c(0.05, 0.05))) +
+          labs(
+            size = expression(paste("-lo", g[10],"(Adjusted P value)")),
+            caption = 'Showing only top-30 gene sets\nNES = Normalized Enrichment Score'
+            # size = 'Gene set\nsize'
+          ) +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = use_linewidth/2),
+            
+            axis.line = element_blank(),
+            axis.ticks = element_line(color = "black", linewidth = use_linewidth/2),
+            axis.text.y = element_text(size = 4),
+            axis.text.x = element_text(size = 4),
+            
+            legend.text = element_text(size = 4), 
+            legend.title = element_text(size = 4),
+            legend.key.width = unit(0.2, "cm")
+          )
+        
+        subchunkify(res, 
+                    fig.width = 3.5, 
+                    fig.height = (3.5*0.3) + nrow(x)*0.05,
+                    dpi = 600,
+                    prefix = 'gse-dotplot',
+                    suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+        cat("\n\n")
+      }
+    }
+  }
+}
+
+ cat("\n\n")
+```
+
+
+
+### Gene-set similarity matrix overall
+```{r gse-jcmatrix-omni, echo=FALSE}
+#
+# Generate a list of JC similarity matrices
+#
+
+p_thrs <- 0.05
+topn <- 20
+
+use_comp <- names(gse_list)[1]
+jc_matrix_list <- foreach(use_comp = names(gse_list)) %do% {
+  data_gse <- foreach(sr = names(gse_collections)) %do% {
+    data_by_collection <- foreach(gc = gse_collections[[sr]], .combine = rbind)  %do% {
+      if(sr == 'GSEA') {
+        x <- gse_list[[use_comp]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          arrange(p.adjust) %>%
+          head(topn)
+        # if(gc == 'msigdb.c2.cp') {
+        #   x %<>% 
+        #     filter(grepl('REACTOME|KEGG|WP', ID))
+        # }
+      }
+      if(sr == 'gseGO') {
+        x <- gse_list[[use_comp]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= p_thrs & simplify) %>% 
+          arrange(p.adjust) %>%
+          head(topn)
+      }
+      if(sr %in% c('gseKEGG', 'gseReactome')) {
+        x <- gse_list[[use_comp]][[sr]]@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          arrange(p.adjust) %>%
+          head(topn)
+      }
+      return(x)
+    }
+    return(data_by_collection)
+  }
+
+  data_gse <- purrr::compact(data_gse)
+  gse_df <- bind_rows(data_gse)
+  if(nrow(gse_df) > 1) {
+    gse_df <- bind_rows(data_gse) %>% 
+      mutate(
+        Description = clean_msigdb_names(Description) %>% tolower() %>% str_to_title,
+        Description = ifelse(grepl("^GO:", ID), paste0("GO:", Description), Description)
+      )
+    # # Select topn by group in selected gset
+    # top_by_group <-   gse_df %>%
+    #   # filter(group == use_comp) %>%
+    #   # filter(p.adjust < p_thrs) %>%
+    #   arrange(p.adjust) %>% pull(Description) %>%
+    #   head(topn)
+    
+    # Data frame to plot
+    res_top <- gse_df %>%
+      # filter(Description %in% top_by_group) %>%
+      mutate(
+        log.p.adjust = -log10(p.adjust),
+        Description = factor(Description)
+      )
+    
+    # Calculate jaccard similarity matrix
+    gset_core_enrichment <- foreach(i = levels(res_top$Description)) %do% {
+      res_top %>% filter(Description == i) %>% pull(core_enrichment) %>%
+        paste(collapse = '/') %>%
+        strsplit('/') %>% unlist %>% unique
+    }
+    names(gset_core_enrichment) <- levels(res_top$Description)
+    
+    use_terms <- res_top$Description %>% unique
+    jc_matrix <- pairwise_terms_jc(gset_core_enrichment[use_terms])
+  } else {
+    jc_matrix <- NULL
+  }  
+  return(jc_matrix)
+}
+
+names(jc_matrix_list) <- names(gse_list)
+jc_matrix_list <- purrr::compact(jc_matrix_list)
+
+```
+
+
+Gene-set similarity matrix by comparison using combining all gene set collections. Heatmap showing the pair-wise similarity matrix of top `r topn` gene sets with an adjusted P value < `r p_thrs` in each gene group. Heatmap colors represent the Jaccard similarity coefficient.
+
+```{r gse-jcmatrix-omni-heatmap, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+library(NbClust)
+
+root_section_number <- 6.4
+section_n <- 1
+
+col_fun <- colorRamp2(seq(0, 1, length.out = 4), brewer.pal(4, "GnBu"))
+
+i <- names(jc_matrix_list)[1]
+for(i in names(jc_matrix_list)) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  
+  cat("<h4> <span class=\"header-section-number\">",h_section_number,"</span>Comparison", i, "</h4>\n\n") #Caue results='asis',we must use raw HTML
+  
+  section_n <- section_n + 1
+  
+  
+  use_mat <- jc_matrix_list[[i]]
+  if(!is.null(use_mat) & nrow(use_mat) > 5) {
+    colnames(use_mat) <- colnames(use_mat) %>% clean_msigdb_names %>% tolower() %>% str_to_title %>% ep_str_wrap(70)
+    rownames(use_mat) <- rownames(use_mat) %>% clean_msigdb_names %>% tolower() %>% str_to_title %>% ep_str_wrap(70)
+    
+    # Define number of clusters
+    use_max.nc <- ifelse(nrow(use_mat) <= 10, 5, round(nrow(use_mat) * 0.3))
+    nbclust_res <- NbClust(data = NULL, diss = as.dist(1-use_mat), distance = NULL, 
+                           min.nc = 2, max.nc = use_max.nc, method = "ward.D",
+                           index = 'silhouette')
+    
+    n_split <- nbclust_res$Best.nc['Number_clusters']
+    
+    ha_top <- HeatmapAnnotation(
+      foo = anno_block(
+        # labels = c("Translation", "Cell division"),
+        labels = 1:n_split,
+        labels_gp = gpar(col = "black", fontsize = 8),
+        gp = gpar(lwd = 0, lty = 0))
+    )
+    
+    ht <- Heatmap(
+      use_mat,
+      name = 'Jaccard index',
+      column_split = n_split,
+      row_split = n_split,
+      column_title = NULL,
+      row_title = NULL,
+      row_names_gp = gpar(fontsize = 4),
+      col = col_fun,
+      show_column_dend = FALSE,
+      show_column_names = FALSE,
+      border = TRUE,
+      top_annotation = ha_top,
+      heatmap_legend_param = list(title_gp = gpar(fontsize = 8),
+                                  labels_gp = gpar(fontsize = 8)
+      ),
+      width = unit(7, "cm"),
+      
+      clustering_method_rows = "ward.D",
+      clustering_method_columns = "ward.D"
+      # clustering_distance_rows = function(x) as.dist(1 - x),
+      # clustering_distance_columns = function(x) as.dist(1 - x)
+    )
+    
+    subchunkify(draw(ht), 
+                fig.width = 7.2, 
+                fig.height = (7.2*0.3) + nrow(use_mat)*0.15,
+                dpi = 600,
+                prefix = 'gse-jcmatrix-omni-heatmap',
+                suffix = tolower(i) %>% gsub(" ", "-", .))
+    cat("\n\n")
+    
+    # 
+    # ht <- Heatmap(
+    #   use_mat,
+    #   name = 'Jaccard index',
+    #   column_split = n_split,
+    #   row_split = n_split,
+    #   column_title = NULL,
+    #   row_title = NULL,
+    #   row_names_gp = gpar(fontsize = 4),
+    #   right_annotation = rowAnnotation(textbox = anno_textbox(split, text))
+    #   col = col_fun,
+    #   show_column_dend = FALSE,
+    #   show_column_names = FALSE,
+    #   border = TRUE,
+    #   top_annotation = ha_top,
+    #   heatmap_legend_param = list(title_gp = gpar(fontsize = 8),
+    #                               labels_gp = gpar(fontsize = 8)
+    #                               ),
+    #   width = unit(7, "cm"),
+    #   
+    #   clustering_method_rows = "complete",
+    #   clustering_method_columns = "complete"
+    #   # clustering_distance_rows = function(x) as.dist(1 - x),
+    #   # clustering_distance_columns = function(x) as.dist(1 - x)
+    #   )
+    # 
+  } else{
+    cat("<p>Not enough gene sets to plot Jaccard similarity matrix.</p>\n\n")
+  }
+}
+
+```
+
+
+### Gene-set similarity matrix by gene set collection
+
+```{r gse-jcmatrix-by-gset, echo=FALSE}
+#
+# Generate a list of JC similarity matrices by gene-set
+#
+library(enrichplot)
+p_thrs <- 0.05
+topn <- 50
+use_comp <- names(gse_list)[1]
+jc_matrix_list <- foreach(use_comp = names(gse_list)) %do% {
+  data_gse <- foreach(sr = names(gse_collections)) %do% {
+    data_by_collection <- foreach(gc = gse_collections[[sr]])  %do% {
+      
+      if(sr == 'GSEA') {
+        use_enrich_results <- gse_list[[use_comp]][[sr]][[gc]]
+        top_descriptions <- use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          head(topn) %>% 
+          pull(Description)
+        use_n_categories <-  use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          nrow
+      }
+      if(sr == 'gseGO') {
+        use_enrich_results <- gse_list[[use_comp]][[sr]][[gc]]
+        top_descriptions <- use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs & simplify) %>% 
+          head(topn) %>% 
+          pull(Description)
+        use_n_categories <-  use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          nrow
+      }
+      if(sr %in% c('gseKEGG', 'gseReactome')) {
+        use_enrich_results <- gse_list[[use_comp]][[sr]]
+        top_descriptions <- use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          head(topn) %>% 
+          pull(Description)
+        use_n_categories <-  use_enrich_results@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          nrow
+      }
+      
+      if(length(top_descriptions) > 1) {
+        use_enrich_results <- pairwise_termsim(
+          use_enrich_results, 
+          showCategory = use_n_categories, 
+          method = "JC")
+        use_enrich_results@termsim[top_descriptions, top_descriptions]
+      } else {
+        NULL
+      }
+    }
+    names(data_by_collection) <- gse_collections[[sr]]
+    return(compact(data_by_collection))
+  }
+  names(data_gse) <- names(gse_collections)
+  return(data_gse)
+}
+names(jc_matrix_list) <- names(gse_list)
+```
+
+
+Gene-set similarity matrix by comparison and gene set collections. Heatmap showing the pair-wise similarity matrix of top `r topn` gene sets with an adjusted P value < `r p_thrs` in each gene group. Heatmap colors represent the Jaccard similarity coefficient.
+
+```{r gse-jcmatrix-by-gset-heatmap, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+library(NbClust)
+
+root_section_number <- 6.5
+section_n <- 1
+subsection_n <- 1
+
+col_fun <- colorRamp2(seq(0, 1, length.out = 4), brewer.pal(4, "GnBu"))
+
+i <- names(jc_matrix_list)[1]
+for(i in names(jc_matrix_list)) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  
+  cat("<h4> <span class=\"header-section-number\">",h_section_number,"</span>Comparison", i, "</h4>\n\n") #Caue results='asis',we must use raw HTML
+  
+  section_n <- section_n + 1
+  
+  for(sr in names(jc_matrix_list[[i]])) {
+    
+    for(gc in names(jc_matrix_list[[i]][[sr]])) {
+      use_mat <- jc_matrix_list[[i]][[sr]][[gc]]
+      if(nrow(use_mat) >= 10) {
+        h_subsection_number <- paste(h_section_number, subsection_n, sep=".")
+        cat("<h5> <span class=\"header-section-number\">",h_subsection_number,"</span>Collection", gc, "</h5>\n\n") #Caue results='asis',we must use raw HTML
+        subsection_n <- subsection_n + 1
+        colnames(use_mat) <- colnames(use_mat) %>% clean_msigdb_names %>% tolower() %>% str_to_title %>% ep_str_wrap(70)
+        rownames(use_mat) <- rownames(use_mat) %>% clean_msigdb_names %>% tolower() %>% str_to_title %>% ep_str_wrap(70)
+        
+        # Define number of clusters
+        use_max.nc <- ifelse(nrow(use_mat) <= 15, 5, round(nrow(use_mat) * 0.3))
+        nbclust_res <- NbClust(data = NULL, diss = as.dist(1-use_mat), distance = NULL, 
+                               min.nc = 2, max.nc = use_max.nc, method = "ward.D",
+                               index = 'silhouette')
+        
+        
+        n_split <- nbclust_res$Best.nc['Number_clusters']
+        
+        # ha_top <- HeatmapAnnotation(
+        #   foo = anno_block(
+        #     # labels = c("Translation", "Cell division"),
+        #     labels = 1:n_split,
+        #     labels_gp = gpar(col = "black", fontsize = 8),
+        #     gp = gpar(lwd = 0, lty = 0))
+        # )
+        
+        ht <- Heatmap(
+          use_mat,
+          name = 'Jaccard index',
+          column_split = n_split,
+          row_split = n_split,
+          column_title = NULL,
+          row_title = NULL,
+          row_names_gp = gpar(fontsize = 4),
+          col = col_fun,
+          show_column_dend = FALSE,
+          show_column_names = FALSE,
+          border = TRUE,
+          # top_annotation = ha_top,
+          heatmap_legend_param = list(title_gp = gpar(fontsize = 8),
+                                      labels_gp = gpar(fontsize = 8)
+          ),
+          width = unit(7, "cm"),
+          
+          clustering_method_rows = "ward.D",
+          clustering_method_columns = "ward.D"
+          # clustering_distance_rows = function(x) as.dist(1 - x),
+          # clustering_distance_columns = function(x) as.dist(1 - x)
+        )
+        
+        subchunkify(draw(ht),
+                    fig.width = 7.2,
+                    fig.height = (7.2*0.3) + nrow(use_mat)*0.15,
+                    dpi = 600,
+                    prefix = 'gse-jcmatrix-by-gset-heatmap',
+                    suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+        cat("\n\n")
+      }
+    }
+  }
+}
+```
+
+
+
+<!-- Restore gse_list names after writing to xlsx -->
+```{r restore-gse-names}
+if(exists('comp_list_description')) {
+  comp_list <- comp_list_backup
+  names(gse_list) <- names_gse_list_backup
+}
+```
+
+
+### Future: Get clusters and represent Dotplots by clusters (see yuwei/tumor-fasting)

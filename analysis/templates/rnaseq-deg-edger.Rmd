@@ -1,0 +1,306 @@
+<!-- To be compatible with workflowr, we need to specify the absolute directory under which the plots are generated, otherwise they will be saved into figure/<basename>.Rmd/<chunk-name>.<extension. and not visible in the html document: https://github.com/workflowr/workflowr/issues/111 -->
+```{r template-options, include = FALSE}
+library(ggbeeswarm)
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+```
+
+
+### Download results
+
+<!-- Write DGE results to xlsx file -->
+```{r write-dge-xlsx}
+# File name summary
+rmd_file <- current_input()
+if(is.null(rmd_file))
+  rmd_file <- 'tmp'
+file_xlsx <- file.path('./docs/file',rmd_file, 'dge.xlsx')
+
+dir.create(dirname(file_xlsx), recursive = TRUE, showWarnings = FALSE)
+
+# Generate workbook
+wb <- createWorkbook()
+for(i in names(dge_list)) {
+  addWorksheet(wb, i)
+  res <- dge_list[[i]]$results %>% 
+    dplyr::select(feature, gene_name, mean, detected, logFC, PValue, FDR, gene_type, description)
+  writeData(wb, i, res)
+}
+saveWorkbook(wb, file_xlsx, TRUE)
+
+dge_file_xlsx <- file_xlsx
+```
+
+<!-- Change dge_list names after writing to xlsx -->
+```{r change-dge-names}
+if(exists('comp_list_description')) {
+  comp_names <- comp_list_description$comparison_long %>% 
+    set_names(comp_list_description$comparison)
+  
+  comp_list_backup <- comp_list
+  names_dge_list_backup <- names(dge_list)
+  
+  names(comp_list) <- comp_names[names(comp_list)]
+  names(dge_list) <- comp_names[names(dge_list)]
+}
+```
+
+The tables of results can be downloaded using the following links:
+
+- [**Differential gene expression**](`r gsub("docs/", "" , dge_file_xlsx)`)
+
+### Download results
+
+- [**Differential gene expression**](`r gsub("docs/", "" , dge_file_xlsx)`)
+
+### Summary of results
+
+#### FDR distribution
+```{r dge-summary-fdr-dist}
+i <- names(dge_list[1])
+res <- foreach(i = names(dge_list), .combine = rbind) %do% {
+  x <- dge_list[[i]]$results
+  c(
+    `FDR < 0.1` = x %>% filter(FDR <= 0.1) %>% nrow,
+    `FDR < 0.05` = x %>% filter(FDR <= 0.05) %>% nrow,
+    `FDR < 0.01` = x %>% filter(FDR <= 0.01) %>% nrow,
+    `FDR < 0.001` = x %>% filter(FDR <= 0.001) %>% nrow,
+    `FDR < 0.0001` = x %>% filter(FDR <= 0.0001) %>% nrow
+  )
+}
+if(class(res)[1] == 'integer'){
+  res <- data.frame(res) %>% t() 
+}
+
+rownames(res) <- names(dge_list)
+res %>% 
+  data.frame(check.names = F) %>% 
+  rownames_to_column('comparison') %>% 
+  kbl(caption = 'Number of genes at different FDR thresholds') %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>%
+  column_spec(1, bold = TRUE)
+```
+
+#### Number of genes at FDR 0.05
+```{r dge-summary-fdr-05}
+i <- names(dge_list[1])
+res <- foreach(i = names(dge_list), .combine = rbind) %do% {
+  x <- dge_list[[i]]$results %>% 
+    filter(FDR <= 0.05)
+  c(
+    `Up` = x %>% filter(logFC > 0) %>% nrow,
+    `Down` = x %>% filter(logFC < 0) %>% nrow
+  )
+}
+if(class(res)[1] == 'integer'){
+  res <- data.frame(res) %>% t() 
+}
+
+rownames(res) <- names(dge_list)
+res %>% 
+  data.frame(check.names = F) %>% 
+  rownames_to_column('comparison') %>% 
+  kbl(caption = 'Number of genes at at FDR < 0.05') %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F) %>%
+  column_spec(1, bold = TRUE)
+```
+
+
+
+### Volcano-plots
+Top-20 genes based on adjusted P-values are labeled.
+```{r dge-volcano-plot, fig.width=2, fig.asp = 0.8}
+i=names(dge_list)[1]
+p_thrs <- 0.05
+for(i in names(dge_list)) {
+  cat("#### Comparison:", i, "\n\n")
+  # cat(dge_list[[i]]$comparison, "\n\n")
+  x <- dge_list[[i]]$results
+  
+  # Labelled plot
+  res <- plot.volcano(
+    x$logFC, 
+    x$FDR, 
+    label = x$gene_name, 
+    label.size = 1, point.size = 0.8,
+    fill.palette = c("gray80", "red"), 
+    top.labels = 20, 
+    pval.thr = p_thrs, 
+    hline.color =  'grey60', hline.type = 2, hline.size = 0.1167156,
+    rasterize = TRUE) +
+    geom_vline(xintercept = 0, linetype = 2, linewidth = 0.1167156, color = 'grey60')
+  print(res)
+  
+  cat("\n\n")
+  
+  # Un-labelled plot
+  res <- plot.volcano(
+    x$logFC, 
+    x$FDR, 
+    label = x$gene_name, 
+    label.size = 1, point.size = 0.8,
+    fill.palette = c("gray80", "red"), 
+    top.labels = 0, 
+    pval.thr = p_thrs, 
+    hline.color =  'grey60', hline.type = 2, hline.size = 0.1167156,
+    rasterize = TRUE) +
+    geom_vline(xintercept = 0, linetype = 2, linewidth = 0.1167156, color = 'grey60')
+  print(res)
+  
+  cat("\n\n")
+}
+```
+
+
+### Heatmaps
+```{r dge-heatmap-plot, fig.width=7.2, fig.asp = 1.8}
+i <- names(dge_list)[1]
+p_thrs <- 0.05
+lfc_thrs <- 1
+topn <- 50
+max_color_range <- 3 # put the color range to -3 to 3
+
+for(i in names(comp_list)) {
+  cat("#### Comparison", i, "\n\n")
+  use_comp <- comp_list[[i]]
+  
+  # Extract samples from comparisons
+  use_samples <- unlist(use_comp[1:2])
+  use_se <- se[,use_samples]
+  
+  # Arrange samples by condition (first control and then sample)
+  use_annot <- colData(use_se) %>% data.frame %>% 
+    mutate(
+      condition_new = ifelse(sample_alias %in% use_comp[[1]], 
+                             names(use_comp)[1], 
+                             names(use_comp)[2]),
+      condition_new = factor(condition_new, levels = names(use_comp)[2:1]),
+      condition_num = as.numeric(condition_new)
+    ) %>% 
+    arrange(condition_num, donor)
+  use_samples <- use_annot$sample_alias
+  
+  # Extract DGE results
+  use_dge <- dge_list[[i]]$results %>% 
+    filter(FDR < p_thrs & abs(logFC) > lfc_thrs) %>% 
+    mutate(direction = ifelse(logFC > 0, 'Up', 'Down')) %>% 
+    arrange(FDR) %>% 
+    head(topn) %>% 
+    arrange(logFC)
+  if(nrow(use_dge) >= 50){
+    cat(paste0("Showing ", nrow(use_dge)," features with FDR < ", p_thrs, " and absolute log2 fold-change > ", lfc_thrs, "\n"))
+  } else {
+    cat(paste0("Only ", nrow(use_dge)," features with FDR < ", p_thrs, " and absolute log2 fold-change > ", lfc_thrs, ". Showing top-", topn," features based on P value and absolute log2 fold-change >", lfc_thrs,"\n"))
+    use_dge <- dge_list[[i]]$results %>% 
+      filter(abs(logFC) > lfc_thrs) %>% 
+      arrange(PValue) %>% 
+      mutate(direction = ifelse(logFC > 0, 'Up', 'Down')) %>% 
+      head(topn) %>% 
+      arrange(logFC)
+  }
+  
+  # Extract matrix of expression
+  mat <- assay(use_se, 'logcounts')[rownames(use_dge), use_samples]
+  rownames(mat) <- make.names(use_dge$gene_name, unique = TRUE)
+  zmat <- t(apply(mat, 1, scale, center = TRUE, scale = TRUE))
+  colnames(zmat) <- colnames(mat)
+  zmat <- zmat[,rownames(use_annot)]
+  
+  # Col Annotation
+  use_annot_levels <- levels(use_annot$condition_new)
+  if(exists('heatmap_col_annot_vars')) {
+    heatmap_col_annot_vars <- intersect(heatmap_col_annot_vars, colnames(use_annot))
+  } else {
+    heatmap_col_annot_vars <- NULL
+  }
+  
+  column_ha_colors <- lapply(heatmap_col_annot_vars, get_palette) %>% 
+    set_names(heatmap_col_annot_vars) %>% 
+    compact
+
+  column_ha <-  HeatmapAnnotation(
+    df = use_annot %>% dplyr::select(all_of(heatmap_col_annot_vars)),
+    condition = anno_block(
+      # gp = gpar(fill = c('#fdbf6f', '#6a3d9a') %>% set_names(use_annot_levels)),
+      labels = use_annot_levels, 
+      labels_gp = gpar(col = "black", fontsize = 8)
+    ),
+    col = column_ha_colors
+  )
+    
+  # Row annotation (right)
+  row_annot_right <-  rowAnnotation(
+    log2FC = anno_numeric(
+      round(use_dge$logFC,1), 
+      labels_gp = gpar(fontsize = 6), 
+      bg_gp = gpar(
+        fill = c("#74add1", "#f46d43"), 
+        col = 'white'
+      ),
+      bar_width = unit(1, "npc") - unit(1.5, "pt")
+    ), 
+    annotation_name_rot = 0)
+  
+  # Row annotation (left)
+  direction_palette <- c('Up' = "#f46d43", 'Down' = "#74add1")
+  direction_palette <- direction_palette[names(direction_palette) %in% use_dge$direction]
+  
+  row_annot_left <-  rowAnnotation(
+    direction = anno_block(
+      gp = gpar(fill = direction_palette),
+      labels = names(direction_palette), 
+      labels_gp = gpar(col = "white", fontsize = 8)
+    )
+  )
+  
+  # Heatmap color
+  zmax <- zmat %>% abs %>% max
+  if(!is.null(max_color_range))
+    zmax <- max_color_range
+  col_fun <-  colorRamp2(
+    seq(-zmax, zmax, length.out = 11),
+    rev(brewer.pal(11, "RdBu"))
+  )
+  
+  # Generate Heatmap
+  htz <- Heatmap(
+    zmat,
+    name= 'z-score',
+    col = col_fun,
+    row_names_gp = gpar(fontsize = 8),
+    column_names_gp = gpar(fontsize = 8),
+    
+    top_annotation = column_ha,
+    column_split = use_annot$condition_num,
+    #cluster_column_slices = turn off the clustering on slices, and now you can precisely control the order of slices
+    cluster_column_slices = FALSE, 
+    column_title = NULL,
+    
+    right_annotation = row_annot_right,
+    row_split = use_dge$direction,
+    # left_annotation = row_annot_left,
+    row_title = NULL
+  )
+  
+  draw(
+    htz, 
+    # heatmap_legend_side = "bottom", 
+    annotation_legend_side = "bottom"
+  )
+    
+  cat("\n\n")
+  
+}
+```
+
+
+
+<!-- Restore dge_list names after writing to xlsx -->
+```{r restore-dge-names}
+if(exists('comp_list_description')) {
+  comp_list <- comp_list_backup
+  names(dge_list) <- names_dge_list_backup
+}
+```
+

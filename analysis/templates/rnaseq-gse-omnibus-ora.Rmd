@@ -1,0 +1,536 @@
+<!-- To be compatible with workflowr, we need to specify the absolute directory under which the plots are generated, otherwise they will be saved into figure/<basename>.Rmd/<chunk-name>.<extension. and not visible in the html document: https://github.com/workflowr/workflowr/issues/111 -->
+```{r template-options, include = FALSE}
+library(ggbeeswarm)
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+```
+
+```{r set-gsea-collections}
+ora_collections <- list(
+  enricher = names(gmt_files_symbols),
+  enrichGO = c("BP", "MF")
+)
+
+```
+
+### Download results
+
+
+<!-- Write ORA results to xlsx file -->
+```{r write-ora_list-xlsx}
+# File name summary
+rmd_file <- current_input()
+if(is.null(rmd_file))
+  rmd_file <- 'tmp'
+
+file_xlsx_list <- list()
+sr <- names(ora_collections)[1]
+gc <- ora_collections[[sr]][1]
+for(sr in names(ora_collections)) {
+  file_xlsx_list[[sr]] <- list()
+  for(gc in ora_collections[[sr]]) {
+    # Generate file
+    file_xlsx <- file.path('./docs/file', 
+                           rmd_file, 
+                           paste0('ora.', tolower(sr), '_', tolower(gc), '.xlsx')
+                           )
+    file_xlsx_list[[sr]][[gc]] <- file_xlsx
+    dir.create(dirname(file_xlsx), recursive = TRUE, showWarnings = FALSE)
+    
+    # Generate workbook
+    wb <- createWorkbook()
+    for(i in names(gse_list)) {
+      if(gc != sr){
+        for(direction in names(gse_list[[i]][[sr]])) {
+          addWorksheet(wb, paste0(i,"-",direction))
+          if(!is.null(gse_list[[i]][[sr]][[direction]][[gc]])) {
+            res <- gse_list[[i]][[sr]][[direction]][[gc]]@result
+            writeData(wb, paste0(i,"-",direction), res)
+          }
+        }
+      }
+      if(gc == sr){
+        for(direction in names(gse_list[[i]][[sr]])) {
+          addWorksheet(wb, paste0(i,"-",direction))
+          if(!is.null(gse_list[[i]][[sr]][[direction]])) {
+            res <- gse_list[[i]][[sr]][[direction]]@result
+            writeData(wb, paste0(i,"-",direction), res)
+          }
+        }
+      }
+    }
+    saveWorkbook(wb, file_xlsx, TRUE)
+  }
+}
+```
+
+<!-- Change gse_list names after writing to xlsx -->
+```{r change-ora-names}
+if(exists('comp_list_description')) {
+  comp_names <- comp_list_description$comparison_long %>% 
+    set_names(comp_list_description$comparison)
+  comp_list_backup <- comp_list
+  names_gse_list_backup <- names(gse_list)
+  
+  names(comp_list) <- comp_names[names(comp_list)]
+  names(gse_list) <- comp_names[names(gse_list)]
+}
+```
+
+<!-- Write links to download ORA results -->
+```{r write-links-ora, echo = TRUE}
+for(sr in names(file_xlsx_list)) {
+  for(gc in names(file_xlsx_list[[sr]])) {
+    file_xlsx <- gsub("docs/", "", file_xlsx_list[[sr]][[gc]])
+    if(sr == 'enricher') {
+      cat(paste0("- [**Over-enrichment analysis: ", gc, "**](", file_xlsx, ")"), '\n\n')
+    }
+    if(sr == 'ernrichGO') {
+      cat(paste0("- [**Over-enrichment analysis: GO:", gc, "**](", file_xlsx, ")"), '\n\n')
+    }
+    if(sr == 'enrichKEGG') {
+      cat(paste0("- [**Over-enrichment analysis: KEGG**](", file_xlsx, ")"), '\n\n')
+    }
+    if(sr == 'enrichReactome') {
+      cat(paste0("- [**Over-enrichment analysis: Reactome**](", file_xlsx, ")"), '\n\n')
+    }
+  }
+}
+```
+
+
+
+
+### Summary of results
+```{r ora-summary-fdr}
+res <- foreach(i = names(gse_list), .combine = rbind) %do% {
+  foreach(sr = names(ora_collections), .combine = rbind) %do% {
+    
+    foreach(gc = ora_collections[[sr]], .combine = rbind) %do% {
+      if(sr == 'enricher') {
+        n_abs <- if(!is.null(gse_list[[i]][[sr]][['abs']][[gc]])) {
+          gse_list[[i]][[sr]][['abs']][[gc]]@result %>% 
+            filter(p.adjust <= 0.05) %>% nrow
+        } else {
+          0
+        }
+        n_down <- if(!is.null(gse_list[[i]][[sr]][['down']][[gc]])) {
+          gse_list[[i]][[sr]][['down']][[gc]]@result %>% 
+            filter(p.adjust <= 0.05) %>% nrow
+        } else {
+          0
+        }
+        n_up <- if(!is.null(gse_list[[i]][[sr]][['up']][[gc]])) {
+          gse_list[[i]][[sr]][['up']][[gc]]@result %>% 
+            filter(p.adjust <= 0.05) %>% nrow
+        } else {
+          0
+        }
+      }
+            if(sr == 'enrichGO') {
+        n_abs <- if(!is.null(gse_list[[i]][[sr]][['abs']][[gc]])) {
+          gse_list[[i]][[sr]][['abs']][[gc]]@result %>% 
+            filter(p.adjust <= 0.05) %>% nrow
+        } else {
+          0
+        }
+        n_down <- if(!is.null(gse_list[[i]][[sr]][['down']][[gc]])) {
+          gse_list[[i]][[sr]][['down']][[gc]]@result %>% 
+            filter(p.adjust <= 0.05) %>% nrow
+        } else {
+          0
+        }
+        n_up <- if(!is.null(gse_list[[i]][[sr]][['up']][[gc]])) {
+          gse_list[[i]][[sr]][['up']][[gc]]@result %>% 
+            filter(p.adjust <= 0.05) %>% nrow
+        } else {
+          0
+        }
+      }
+        
+        
+        c(
+          Comparison = i,
+          `Collection` = gc,
+          `Total` = n_abs,
+          `Supressed` = n_down,
+          `Activated` = n_up
+        )
+      
+    }
+  }
+}
+
+res <- res %>% data.frame(check.names = F)
+
+```
+
+#### Table
+```{r ora-summary-fdr-table}
+res %>% 
+  data.frame(check.names = F) %>% 
+  kbl(caption = 'Number of gene sets at FDR < 0.05',
+              row.names = F) %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), 
+              full_width = F) %>%
+  column_spec(1, bold = TRUE)
+```
+
+#### Barplot
+```{r gse-summary-fdr-barplot, fig.asp = 1.3}
+res_plot <- res %>% 
+  pivot_longer(cols = c('Total', 'Supressed', 'Activated'), names_to = 'Direction', values_to = 'Count') %>% 
+  mutate(
+    comb_names = paste(Comparison, Collection),
+    Count = as.numeric(Count),
+    Comparison = gsub("-over-", " over\n", Comparison),
+    Comparison = gsub(" corrected", "\ncorrected", Comparison)
+  ) %>% 
+  ggplot(aes(Collection, Count, fill = Direction)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  facet_grid(rows = vars(Comparison)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  scale_fill_manual(values = c(Supressed = '#74add1', 
+                               Activated = '#f46d43',
+                               Total = 'grey80')
+  ) +
+  labs(x = '', fill = '') +
+  theme_facet +
+  theme(
+    axis.line = element_blank(),
+    axis.ticks = element_line(linewidth = one_pt/4, color = 'black'),
+    strip.text = element_text(size = 5)
+    
+  )
+
+
+subchunkify(
+  print(res_plot), 
+  fig.width = 3.5, 
+  fig.height = 3.5*0.4,
+  dpi = 600,
+  prefix = 'gse-summary-fdr-barplot'
+  # suffix = tolower(i) %>% gsub(" ", "-", .)
+)
+cat("\n\n")
+```
+
+
+### Dotplots
+
+<!-- # Subchunkify dotplots -->
+<!-- ## chunk options need to be set to echo=FALSE, results='asis' -->
+<!-- ## Cause results='asis',we must use raw HTML to print text and headings -->
+```{r ora-dotplot, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+use_linewidth <- 1/2.141959
+root_section_number <- 6.3
+section_n <- 1
+subsection_n <- 1
+n_top <- 10
+
+for(i in names(gse_list)) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  cat("<h5> <span class=\"header-section-number\">",h_section_number,"</span>Comparison", i, "</h5>\n\n") #Caue results='asis',we must use raw HTML
+  section_n <- section_n + 1
+  for(sr in names(ora_collections)) {
+    for(gc in ora_collections[[sr]]) {
+      if(sr == 'enricher') {
+        
+        if(!is.null(gse_list[[i]][[sr]][["up"]][[gc]])) {
+          x_up <- gse_list[[i]][[sr]][["up"]][[gc]]@result %>% 
+            filter(p.adjust <= 0.05) %>% 
+            mutate(
+              Description = clean_msigdb_names(Description),
+              Direction = 'Up'
+            ) %>% 
+            head(n_top)
+        } else {
+          x_up <- data.frame()
+        }
+        if(!is.null(gse_list[[i]][[sr]][["down"]][[gc]])) {
+          x_down <- gse_list[[i]][[sr]][["down"]][[gc]]@result %>% 
+            filter(p.adjust <= 0.05) %>% 
+            mutate(
+              Description = clean_msigdb_names(Description),
+              Direction = 'Down'
+            ) %>% 
+            head(n_top)
+        } else {
+          x_down <- data.frame()
+        }
+        if(!is.null(gse_list[[i]][[sr]][["abs"]][[gc]])) {
+          x_abs <- gse_list[[i]][[sr]][["abs"]][[gc]]@result %>% 
+            filter(p.adjust <= 0.05 & !(ID %in% x_up$ID) & !(ID %in% x_down$ID)) %>% 
+            mutate(
+              Description = clean_msigdb_names(Description),
+              Direction = 'Abs'
+            )  %>% 
+            head(n_top)
+        } else {
+          x_abs <- data.frame()
+        }
+        
+        x <- rbind(x_up, x_down, x_abs)
+      }
+      
+      if(sr == 'enrichGO') {
+        
+        if(!is.null(gse_list[[i]][[sr]][["up"]][[gc]])) {
+          x_up <- gse_list[[i]][[sr]][["up"]][[gc]]@result %>% 
+            filter(p.adjust <= 0.05) %>% 
+            mutate(
+              Description = clean_msigdb_names(Description),
+              Direction = 'Up'
+            ) %>% 
+            filter(simplify) %>% 
+            head(n_top)
+        } else {
+          x_up <- data.frame()
+        }
+        if(!is.null(gse_list[[i]][[sr]][["down"]][[gc]])) {
+          x_down <- gse_list[[i]][[sr]][["down"]][[gc]]@result %>% 
+            filter(p.adjust <= 0.05) %>% 
+            mutate(
+              Description = clean_msigdb_names(Description),
+              Direction = 'Down'
+            ) %>% 
+            filter(simplify) %>% 
+            head(n_top)
+        } else {
+          x_down <- data.frame()
+        }
+        if(!is.null(gse_list[[i]][[sr]][["abs"]][[gc]])) {
+          x_abs <- gse_list[[i]][[sr]][["abs"]][[gc]]@result %>% 
+            filter(p.adjust <= 0.05 & !(ID %in% x_up$ID) & !(ID %in% x_down$ID)) %>% 
+            filter(simplify) %>% 
+            mutate(
+              Description = clean_msigdb_names(Description),
+              Direction = 'Abs'
+            )  %>% 
+            head(n_top)
+        } else {
+          x_abs <- data.frame()
+        }
+        
+        x <- rbind(x_up, x_down, x_abs)
+      }
+      
+      if(nrow(x) > 0) {
+        h_subsection_number <- paste(h_section_number, subsection_n, sep=".")
+        cat("<h6> <span class=\"header-section-number\">",h_subsection_number,"</span>Collection", gc, "</h6>\n\n") #Caue results='asis',we must use raw HTML
+        subsection_n <- subsection_n + 1
+        
+        x %<>% 
+          mutate(
+            log10P = -log10(p.adjust),
+            Description = fct_reorder(Description, p.adjust, .desc = TRUE),
+            Direction = factor(Direction, levels = c('Up', 'Down', 'Abs'))
+            )
+        
+        res <- x %>% 
+          ggplot(aes(x = log10P, y = Description, 
+                     color = Direction,
+                     size = GeneProp)) +
+          geom_point(pch = 16, alpha = 0.8) + 
+          facet_grid(rows = vars(Direction), scale = 'free_y', space = 'free_y') +
+          scale_y_discrete(labels = default_labeller(50)) +
+          scale_color_manual(values = c(Up = 'firebrick', Down = 'dodgerblue', Abs = 'grey50')) +
+          scale_size_continuous(range=c(0.3, 2.5)) +
+          scale_x_continuous(expand = expansion(mult = c(0.05, 0.05))) +
+          labs(
+            x = expression(paste("-lo", g[10],"(Adjusted P value)")),
+            y = '',
+            size = 'Gene proportion'
+          ) +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = use_linewidth/2),
+            
+            axis.line = element_blank(),
+            axis.ticks = element_line(color = "black", linewidth = use_linewidth/2),
+            axis.text.y = element_text(size = 4),
+            axis.text.x = element_text(size = 4),
+            
+            legend.text = element_text(size = 4), 
+            legend.title = element_text(size = 4),
+            legend.key.width = unit(0.2, "cm")
+          )
+        
+        subchunkify(res, 
+                    fig.width = 3.5, 
+                    fig.height = (3.5*0.3) + nrow(x)*0.10,
+                    dpi = 600,
+                    prefix = paste0('ora-dotplot'),
+                    suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+        cat("\n\n")
+      }
+    }
+  }
+}
+
+ cat("\n\n")
+```
+
+### Similarity matrix by gene set collection
+
+```{r ora-jcmatrix-by-gset, echo=FALSE}
+#
+# Generate a list of JC similarity matrices by gene-set
+#
+library(enrichplot)
+p_thrs <- 0.05
+topn <- 50
+use_comp <- names(gse_list)[1]
+sr <- 'enricher'
+jc_matrix_list <- foreach(use_comp = names(gse_list)) %do% {
+  data_gse <- foreach(sr = names(ora_collections)) %do% {
+    data_by_collection <- foreach(gc = ora_collections[[sr]])  %do% {
+      
+      if(sr == 'enricher') {
+        res_direction <- foreach(direction = c('up', 'down', 'abs')) %do% {
+          if(!is.null(gse_list[[use_comp]][[sr]][[direction]][[gc]])) {
+            use_enrich_results <- gse_list[[use_comp]][[sr]][[direction]][[gc]]
+            top_descriptions <- use_enrich_results@result %>% 
+              filter(p.adjust <= p_thrs) %>% 
+              head(topn) %>% 
+              pull(Description)
+            use_n_categories <-  use_enrich_results@result %>% 
+              filter(p.adjust <= p_thrs) %>% 
+              nrow
+            
+            if(length(top_descriptions) > 1) {
+              use_enrich_results <- pairwise_termsim(
+                use_enrich_results, 
+                showCategory = use_n_categories, 
+                method = "JC")
+              use_enrich_results@termsim[top_descriptions, top_descriptions]
+            } else {
+              NULL
+            }
+          } else {
+            NULL
+          }
+        }
+        names(res_direction) <- c('up', 'down', 'abs')
+        return(compact(res_direction))
+      }
+    }
+    
+    names(data_by_collection) <- ora_collections[[sr]]
+    return(compact(data_by_collection))
+  }
+  names(data_gse) <- names(ora_collections)
+  return(data_gse)
+}
+names(jc_matrix_list) <- names(gse_list)
+```
+
+
+Gene-set similarity matrix by comparison, gene set collections and direction. Heatmap showing the pair-wise similarity matrix of top `r topn` gene sets with an adjusted P value < `r p_thrs` in each gene group. Heatmap colors represent the Jaccard similarity coefficient.
+
+
+```{r ora-jcmatrix-by-gset-heatmap, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+
+library(NbClust)
+
+root_section_number <- 6.5
+section_n <- 1
+subsection_n <- 1
+
+col_fun <- colorRamp2(seq(0, 1, length.out = 4), brewer.pal(4, "GnBu"))
+
+i <- names(jc_matrix_list)[1]
+for(i in names(jc_matrix_list)) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  
+  cat("<h5> <span class=\"header-section-number\">",h_section_number,"</span>Comparison", i, "</h5>\n\n") #Caue results='asis',we must use raw HTML
+  
+  section_n <- section_n + 1
+  
+  for(sr in names(jc_matrix_list[[i]])) {
+    for(gc in names(jc_matrix_list[[i]][[sr]])) {
+      cat("<h6> <span class=\"header-section-number\">",h_subsection_number,"</span>Collection", gc, "</h6>\n\n") #Caue results='asis',we must use raw HTML
+      
+      for(direction in names(jc_matrix_list[[i]][[sr]][[gc]])) {
+        use_mat <- jc_matrix_list[[i]][[sr]][[gc]][[direction]]
+        if(nrow(use_mat) >= 10) {
+          h_subsection_number <- paste(h_section_number, subsection_n, sep=".")
+          subsection_n <- subsection_n + 1
+          colnames(use_mat) <- colnames(use_mat) %>% clean_msigdb_names %>% tolower() %>% str_to_title %>% ep_str_wrap(70)
+          rownames(use_mat) <- rownames(use_mat) %>% clean_msigdb_names %>% tolower() %>% str_to_title %>% ep_str_wrap(70)
+          
+          # Define number of clusters
+          use_max.nc <- ifelse(nrow(use_mat) <= 15, 5, round(nrow(use_mat) * 0.3))
+          nbclust_res <- NbClust(data = NULL, diss = as.dist(1-use_mat), distance = NULL, 
+                                 min.nc = 2, max.nc = use_max.nc, method = "ward.D",
+                                 index = 'silhouette')
+          
+          
+          n_split <- nbclust_res$Best.nc['Number_clusters']
+          
+          if(n_split == -Inf) {
+            n_split <- NULL
+          }
+          # ha_top <- HeatmapAnnotation(
+          #   foo = anno_block(
+          #     # labels = c("Translation", "Cell division"),
+          #     labels = 1:n_split,
+          #     labels_gp = gpar(col = "black", fontsize = 8),
+          #     gp = gpar(lwd = 0, lty = 0))
+          # )
+          
+          ht <- Heatmap(
+            use_mat,
+            name = 'Jaccard index',
+            column_title = paste('Direction:', direction),
+            column_split = n_split,
+            row_split = n_split,
+            row_title = NULL,
+            row_names_gp = gpar(fontsize = 4),
+            col = col_fun,
+            show_column_dend = FALSE,
+            show_column_names = FALSE,
+            border = TRUE,
+            # top_annotation = ha_top,
+            heatmap_legend_param = list(title_gp = gpar(fontsize = 8),
+                                        labels_gp = gpar(fontsize = 8)
+            ),
+            width = unit(7, "cm"),
+            
+            clustering_method_rows = "ward.D",
+            clustering_method_columns = "ward.D"
+            # clustering_distance_rows = function(x) as.dist(1 - x),
+            # clustering_distance_columns = function(x) as.dist(1 - x)
+          )
+          subchunkify(draw(ht),
+                      fig.width = 7.2,
+                      fig.height = (7.2*0.3) + nrow(use_mat)*0.15,
+                      dpi = 600,
+                      prefix = 'ora-jcmatrix-by-gset-heatmap',
+                      suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc, '_', direction) )
+          
+          cat("\n\n")
+        }
+      }
+    }
+  }
+}
+```
+
+
+<!-- Restore gse_list names after writing to xlsx -->
+```{r restore-gse-names}
+if(exists('comp_list_description')) {
+  comp_list <- comp_list_backup
+  names(gse_list) <- names_gse_list_backup
+}
+```
