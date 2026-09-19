@@ -1,0 +1,981 @@
+---
+title: Analysis of CTCs from HT29_Li.M2 model
+subtitle: Explorative analysis of human reads removing PC1
+author: Francesc Castro-Giner
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  se_path: ./data/rnaseq/HT29_Li.M2/se_hs.rds
+  output_dir: ./output/rnaseq/HT29_Li.M2/exploratory
+  group: anatomical_origin
+  min_counts: 5
+  min_present_prop: 0.70
+  msigdb_dir: ./data/resources/MSigDB
+  msigdb_vs: v2026.1.Hs
+  ann_vars: anatomical_origin,sample_type,n_cells,detected,sum,subsets_Mito_percent,subsets_Ribo_percent,mouse_id,cc_phase,cc_g1_score_cy,cc_s_score_cy,cc_g2m_score_cy
+  run_cl_mk: FALSE
+---
+
+## Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', dpi = 600, dev = c("png", "pdf"), engine.opts = list(bash = "-l"), fig.width = 3.5, fig.asp = 0.618)
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(showtext)
+library(foreach)
+library(DT)
+library(knitr)
+library(kableExtra)
+library(cowplot)
+library(colorblindr)
+library(RColorBrewer)
+library(ggbeeswarm)
+library(ggrepel)
+library(magrittr)
+library(openxlsx)
+library(arsenal)
+
+library(SummarizedExperiment)
+library(edgeR)
+library(DESeq2)
+library(scuttle)
+library(scran)
+library(pheatmap)
+library(PCAtools)
+library(org.Hs.eg.db)
+library(ComplexHeatmap)
+library(circlize)
+library(GSVA)
+library(babelgene)
+library(dynamicTreeCut)
+library(dendextend)
+```
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+
+Set color palettes
+```{r, echo = FALSE}
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+Load custom functions
+```{r load-functions}
+source('./code/R-functions/dge_wrappers.r')
+source('./code/R-functions/dge_report.r')
+source('./code/R-functions/gse_omnibus.r')
+source('./code/R-functions/gse_report.r')
+source('./code/R-functions/subchunkify.R')
+source('./code/R-functions/pairwise_terms_jc.r')
+source('./code/R-functions/eigencorval.R')
+
+
+
+clean_msigdb_names <- function(x) x %>% gsub('REACTOME_', '', .) %>% gsub('WP_', '', .) %>% gsub('BIOCARTA_', '', .) %>% gsub('KEGG_', '', .) %>% gsub('PID_', '', .) %>% gsub('GOBP_', '', .) %>% gsub('_', ' ', .)
+```
+
+Define additional functions
+```{r add-functions}
+clean_sample_alias <- function(x) 
+  gsub('o[0-9]*_[0-9]*-|_gDNA.*', '', x) %>% gsub(".*-MS", "MS", .) %>% gsub("_S[0-9]+_R[0-9].*", "", .) %>% gsub('__STARpass1', '', .) %>% gsub(".k2report", "", .) %>% gsub(".*-|.disambiguated.*", "", .)
+```
+
+Load MSigDB gene sets
+```{r load-msigdb}
+gmt_files_symbols <- list(
+  msigdb.c2.cp = paste0(params$msigdb_dir, '/', params$msigdb_vs, '/c2.cp.', params$msigdb_vs, '.symbols.gmt')
+)
+```
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+
+## Data wrangling
+
+### Human data
+Load SE object
+```{r dw-load-se-hs}
+se <- readRDS(params$se_path)
+```
+
+Cell cycle annotation with cyclone, before filtering low abundance genes: *Users should not filter out low-abundance genes before applying cyclone. Even if a gene is not expressed in any cell, it may still be useful for classification if it is phase-specific.*
+```{r dw-cc-cyclone}
+cc.pairs <- readRDS(system.file("exdata", "human_cycle_markers.rds", 
+    package="scran"))
+res <- cyclone(se, cc.pairs)
+se$cc_phase_cy <- res$phases
+se$cc_g1_score_cy <- res$normalized.scores$G1
+se$cc_s_score_cy <- res$normalized.scores$S
+se$cc_g2m_score_cy <- res$normalized.scores$G2M
+cc_assignments_cy <- res
+```
+
+
+Filtering out low-abundance features. Keeping those features with at least 5 counts in at least 50% of samples of the smallest group.
+```{r dw-subset-feature-abundance-hs}
+# Not done: it is done at DGE level, for each comparison
+use_rows <- filterByExpr(se, group=colData(se)[[params$group]], min.count = 5, min.total.count = 15, min.prop = 0.5)
+se <- se[use_rows,]
+```
+
+TMM normalization
+```{r dw-tmm-hs}
+norm_method <- "TMM"
+exprs_mat_for_norm <- assay(se, 'counts')
+norm_factors <- calcNormFactors(exprs_mat_for_norm, method = norm_method)
+lib_size <- colSums(exprs_mat_for_norm)/10^6
+se$size_factor <- (norm_factors * lib_size)
+se <- logNormCounts(se, size.factors =se$size_factor)
+se <- logNormCounts(se, size.factors =se$size_factor, log = FALSE)
+```
+
+CPM calculation
+```{r dw-cpm-hs}
+assay(se, 'cpm') <- edgeR::cpm(assay(se, 'normcounts'))
+assay(se, 'logcpm') <- edgeR::cpm(assay(se, 'normcounts'), log = TRUE)
+```
+
+
+
+### Additional objects
+Selection of HVG
+```{r conf-hvg}
+# Variance modelling
+fit_res <- modelGeneVar(se)
+fit_md <- metadata(fit_res)
+# Define highly variable genes
+hvg <- getTopHVGs(fit_res, prop = 0.1)
+```
+
+Annotation variables and colors
+```{r conf-annot}
+ann_vars <- strsplit(params$ann_vars, ",") %>% unlist %>% 
+  intersect(., colData(se) %>% colnames)
+ann_df <- colData(se) %>% data.frame %>% 
+  dplyr::select(all_of(ann_vars))
+
+ann_colors <- foreach(i = ann_vars) %do% {
+  get_palette(i)
+}
+names(ann_colors) <- ann_vars
+ann_colors <- compact(ann_colors)
+```
+
+
+## PCA
+```{r pca-conf}
+use_rows <- hvg
+mat <- assay(se[use_rows,], 'logcounts')
+rownames(mat) <- make.names(rowData(se[use_rows,])$gene_name,unique = T)
+# Create annotation, keeping only variables with more than 1 unique value
+use_cols <- ann_df %>% dplyr::select(where(~n_distinct(.) > 1)) %>% colnames
+p <- PCAtools::pca(mat, metadata = colData(se) %>% data.frame %>% dplyr::select(all_of(use_cols)))
+```
+
+
+### Determine optimum number of PCs to retain
+Horn’s parallel analysis and elbow method
+```{r pca-elbow, fig.width = 3.1, fig.asp = 0.9}
+horn <- parallelPCA(mat)
+elbow <- findElbowPoint(p$variance)
+# horn$n
+# elbow
+screeplot(
+  p,
+  axisLabSize = 8, titleLabSize = 8,
+  components = getComponents(p, 1:20),
+  vline = c(horn$n, elbow)
+) +
+  geom_label(aes(x = horn$n + 0.5, y = 25, label = 'Horn\'s', vjust = -1),
+             size = geom_text_size) +
+  geom_label(aes(x = elbow + 0.5, y = 50, label = 'Elbow method', vjust = -1),
+             size = geom_text_size)
+```
+
+
+
+### Variable correlation
+Plot showing the correlation of PCs with sample-level variables. 
+```{r pca-eigencor-plot, fig.width = 7.2}
+use_rows <- hvg
+n_pc <- seq_len(horn$n)
+if(horn$n <= 2)
+  n_pc <- 1:3
+
+eigencor_res <- eigencorval(p, components = getComponents(p, n_pc), metavars = colnames(p$metadata))
+```
+
+```{r pca-eigencor-plot-curated, fig.width = 7.2}
+use_rows <- hvg
+n_pc <- seq_len(horn$n)
+if(horn$n <= 2)
+  n_pc <- 1:3
+
+selected_vars <- c(
+  `Anatomical origin` = 'anatomical_origin',
+  `CTC type` = 'sample_type',
+  `Number of cells` = 'n_cells',
+  `Detected genes` = 'detected',
+  `Total counts` = 'sum',
+  `Mitochondrial %` = 'subsets_Mito_percent',
+  `Ribosomal %` = 'subsets_Ribo_percent',
+  `Mouse ID` = 'mouse_id',
+  `G1 score` = 'cc_g1_score_cy',
+  `S score` = 'cc_s_score_cy',
+  `G2M score` = 'cc_g2m_score_cy'
+)
+
+p_curated <- p  
+p_curated$metadata <- p_curated$metadata %>% 
+  dplyr::rename(all_of(selected_vars))
+eigencor_res <- eigencorval(p_curated, components = getComponents(p_curated, n_pc), metavars = names(selected_vars))
+
+# Plot correlation
+eigencorplot(p_curated,
+             components = getComponents(p_curated, n_pc),
+             metavars = names(selected_vars),
+             fontCorval = 2,
+             cexCorval = 0.8,
+             main = 'PC sample variables correlation')
+
+
+```
+
+## Hierarchical clustering removing PC1
+```{r hclust-conf}
+dst <- dist(p$rotated[,2:10], method = 'euclidean')
+hc <-  dst %>% hclust(method = 'ward.D2')
+dend <- hc %>% as.dendrogram()
+column_dend<- dend
+
+## Find Clusters
+clusters_original <- cutreeDynamic(hc, distM = as.matrix(dst),
+                                   minClusterSize = 15, method="tree")
+if(min(clusters_original) == 0) {
+  clusters_original <- clusters_original + 1
+}
+
+## Add clustering info to se
+
+
+cluster_info <- data.frame(
+  sample_alias = rownames(p$rotated)[order.dendrogram(dend)],
+  cluster_rmpc1 = as.character(clusters_original[order.dendrogram(dend)]) %>% 
+    factor(levels = as.character(unique(clusters_original)))
+  )
+
+if(!is.null(se$cluster_rmpc1))
+  se$cluster_rmpc1 <- NULL
+colData(se) <- colData(se) %>% data.frame %>% 
+  left_join(cluster_info) %>% 
+  mutate(torownames = sample_alias) %>%
+  column_to_rownames('torownames') %>% 
+  DataFrame
+
+ann_df$cluster_rmpc1 <- colData(se)[rownames(ann_df), 'cluster_rmpc1'] %>% as.character
+```
+
+### Dendrogram
+Plot hierarchical clustering
+```{r hclust-plot, fig.width=7.2}
+## Sort clusters to the order of the dendrogram:
+clusters <- clusters_original[order.dendrogram(dend)]
+clusters_numbers <- unique(clusters) - (0 %in% clusters)
+n_clusters <- length(clusters_numbers)
+cluster_cols <- rainbow_hcl(n_clusters) %>% 
+  set_names(1:n_clusters)
+column_dend_colored <- dend %>% 
+         branches_attr_by_clusters(clusters, values = cluster_cols) 
+
+
+# Add color lables
+bar_var_sorted <- ann_df[[params$group]][order.dendrogram(dend)]
+bar_color <- get_palette(params$group)[bar_var_sorted]
+
+# Plot colored dendrogram
+plot(column_dend_colored)
+colored_bars(colors = bar_color, dend = column_dend_colored, rowLabels = params$group)
+
+# Add cluster color to annotation df
+ann_colors$cluster_rmpc1 <- cluster_cols
+```
+
+
+### Heatmap simplified
+```{r hclust-heatmap-simplified, fig.width=4.5, fig.asp=0.8}
+mat <- p$rotated[,2:10] %>% t
+
+pc_var <- paste0(p$variance[rownames(mat)] %>% round(1), '%')
+rownames(mat) <- paste(rownames(mat), pc_var, sep = ' (') %>% paste0(')')
+
+zmat <- t(scale(t(mat)))
+
+use_annot <- colData(se) %>% data.frame %>% 
+  mutate(
+    anatomical_origin = ifelse(anatomical_origin == 'heart_puncture', 'heart puncture', anatomical_origin),
+    anatomical_origin = ifelse(anatomical_origin == 'portal_vein', 'portal vein', anatomical_origin)
+    )
+
+# Column annotation
+heatmap_col_annot_vars <- c('anatomical_origin')
+
+column_ha_colors <- lapply(heatmap_col_annot_vars, get_palette) %>% 
+    set_names(heatmap_col_annot_vars) %>% 
+    compact
+
+column_ha <-  HeatmapAnnotation(
+    df = use_annot %>% dplyr::select(all_of(heatmap_col_annot_vars)),
+    col = column_ha_colors,
+    annotation_name_gp = gpar(fontsize = 8),
+    simple_anno_size = unit(0.2, "cm"),
+    annotation_legend_param = list(
+      title_gp = gpar(fontsize = 8),
+      labels_gp = gpar(fontsize = 8)
+    )
+  )
+
+ht <- Heatmap(
+  mat,
+  name = 'Loadings',
+  row_names_gp = gpar(fontsize = 8),
+  show_column_names = FALSE,
+  show_column_dend = TRUE,
+  cluster_rows = FALSE,
+  # cluster_columns = hc,
+  
+  top_annotation = column_ha,
+  
+  column_split = as.character(use_annot$cluster_rmpc1),
+  column_title = "Cluster %s",
+  column_title_gp = gpar(fontsize = 8),
+  
+  heatmap_legend_param = list(
+    title_gp = gpar(fontsize = 8),
+    labels_gp = gpar(fontsize = 8),
+    ncol = 2
+  )
+)
+
+draw(
+  ht, 
+  annotation_legend_side = "bottom"
+)
+
+cat("\n\n")
+
+```
+
+
+
+
+
+### Descriptive table
+```{r hclust-descriptive-table}
+use_formula <- as.formula(paste0(params$group, " ~ cluster_rmpc1"))
+tab1 <- tableby(use_formula, 
+                data=colData(se) %>% data.frame,total = FALSE)
+summary(tab1)
+
+# Cochran–Armitage trend test
+use_table <- table(colData(se)[[params$group]], se$cluster_rmpc1)
+
+res <- prop.trend.test(
+  x = use_table['portal_vein', ], 
+  n = table(se$cluster_rmpc1)
+)
+
+broom::tidy(res) %>% 
+  mutate(one.sided.p = p.value / 2) %>% 
+  kbl(caption = 'Cochran–Armitage trend test') %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+#
+
+tab1 <- tableby(use_formula, 
+                data=colData(se) %>% data.frame,total = FALSE, strata=sample_type)
+summary(tab1)
+
+use_formula <- as.formula(paste0("cluster_rmpc1", "~", paste(ann_vars, collapse = "+")))
+tab1 <- tableby(use_formula, 
+                data=colData(se) %>% data.frame,total = FALSE)
+summary(tab1)
+```
+
+
+```{r hclust-12grouped-descriptive-table}
+se$cluster_rmpc1_cl3 <- ifelse(as.character(se$cluster_rmpc1) %in% c('1', '2'), '1-2', '3')
+use_formula <- as.formula(paste0(params$group, " ~ cluster_rmpc1_cl3"))
+tab1 <- tableby(use_formula, 
+                data=colData(se) %>% data.frame,total = FALSE)
+summary(tab1, pfootnote=TRUE)
+
+
+
+tab1 <- tableby(use_formula, 
+                data=colData(se) %>% data.frame,total = FALSE, strata=sample_type)
+summary(tab1, pfootnote=TRUE)
+
+use_formula <- as.formula(paste0("cluster_rmpc1_cl3", "~", paste(ann_vars, collapse = "+")))
+tab1 <- tableby(use_formula, 
+                data=colData(se) %>% data.frame,total = FALSE)
+summary(tab1, pfootnote=TRUE)
+
+```
+
+
+
+## Cluster markers: Differential expression
+```{r hclust-mk-conf}
+clvar <- 'cluster_rmpc1'
+se$uclust <- colData(se)[[clvar]]
+
+# Define comparisons
+x <- "1"
+comp_list <- foreach(x = levels(se$uclust)) %do%{
+  y <- setdiff( levels(se$uclust), x)
+  list(
+    colnames(se)[as.character(se$uclust) == x],
+    colnames(se)[as.character(se$uclust)%in% y]
+  ) %>% set_names(c(x, paste(y, collapse = "-")))
+}
+names(comp_list) <- levels(se$uclust)
+
+# RUN edgeR_dge and gse_omnibus
+if(params$run_cl_mk){
+  # Get ensembl annotation
+  ensembl <-  biomaRt::useEnsembl(biomart="genes", dataset="hsapiens_gene_ensembl",
+                                  mirror = 'useast')
+  gene_desc <- biomaRt::getBM(attributes=c('external_gene_name','description'),
+                              filters = 'external_gene_name',
+                              values = rowData(se)$gene_name, mart =ensembl) %>%
+    dplyr::rename('gene_name' = 'external_gene_name') %>%
+    unique
+  
+  gene_desc <- gene_desc[!duplicated(gene_desc$gene_name),]
+  # saveRDS(gene_desc, file = file.path(dirname(params$se_path), 'ensembl_gene_desc.rds'))
+  
+  # Run differential expression analysis using EdgeR QLF
+  use_comp <-  comp_list[[1]]
+  dge_list <- foreach(use_comp = comp_list) %do%{
+    se_cols <- se$sample_alias %in% unlist(use_comp)
+    use_se <- se[,se_cols]
+    use_se$group <- ifelse(
+      use_se$sample_alias %in% use_comp[[1]],
+      names(use_comp)[1],
+      names(use_comp)[2]
+    )
+    
+    if(is.null(use_comp$batch)) {
+      dge <- edgeR_dge(
+        use_se,
+        # Design configuration for differential expression
+        group_var =  'group',
+        group_sample = names(use_comp)[1],
+        group_ref = names(use_comp)[2],
+        design_formula = "~ group",
+        coef = 'last',
+        # Conversion from SingleCellExperiment/Summarized Experiment to DGEList
+        assay_to_DGEList = 'counts',
+        assay_to_row_filter = "counts",
+        # Feature filtering parameters
+        use_filterByExpr = TRUE,
+        min_counts = params$min_counts,
+        min_present_prop = params$min_present_prop,
+        # EdgeR workflow configuration
+        run_calcNormFactors = 'TMM',
+        estimateDisp_robust = TRUE,
+        estimateDisp_trend.method = "locfit",
+        glm_approach = "QLF",
+        # Output configuration
+        adjust_method = 'BH'
+      )
+    } else {
+      design_formula = paste0("~ ", use_comp$batch," + group")
+      dge <- edgeR_dge(
+        use_se,
+        # Design configuration for differential expression
+        group_var =  'group',
+        group_sample = names(use_comp)[1],
+        group_ref = names(use_comp)[2],
+        batch_vars = use_comp$batch,
+        design_formula = design_formula,
+        coef = 'last',
+        # Conversion from SingleCellExperiment/Summarized Experiment to DGEList
+        assay_to_DGEList = 'counts',
+        assay_to_row_filter = "counts",
+        # Feature filtering parameters
+        use_filterByExpr = TRUE,
+        min_counts = params$min_counts,
+        min_present_prop = params$min_present_prop,
+        # EdgeR workflow configuration
+        run_calcNormFactors = 'TMM',
+        estimateDisp_robust = TRUE,
+        estimateDisp_trend.method = "locfit",
+        glm_approach = "QLF",
+        # Output configuration
+        adjust_method = 'BH'
+      )
+    }
+    
+    # Add gene description
+    use_res <- dge$results %>%  left_join(., gene_desc, relationship = "many-to-many")
+    dge$results <- use_res %>% 
+      filter(!duplicated(feature)) %>% 
+      mutate(rownames = feature) %>% 
+      column_to_rownames('rownames')
+    
+    return(dge)
+  }
+  names(dge_list) <- names(comp_list)
+  saveRDS(dge_list, file = file.path(params$output_dir, paste0('dge-',clvar,'.rds')))
+}
+
+dge_list <- readRDS(file.path(params$output_dir, paste0('dge-',clvar,'.rds')))
+```
+
+<!-- Run template -->
+```{r knitr-template-rnaseq-deg-edger}
+# Configuration: variable evalauted in differential expression is by default included
+heatmap_col_annot_vars <- c('mouse_id', 'sample_type')
+
+# knit template: https://workflowr.github.io/workflowr/articles/wflow-07-common-code.html
+src <- knit_expand(
+  file = here::here("analysis/templates/rnaseq-deg-edger.Rmd")
+  )
+```
+`r knit(text = src)`
+
+## Cluster markers : ORA
+```{r hclust-mk-ora-conf}
+# Run ORA gse_omnibus
+if(params$run_cl_mk){
+  
+  # Run functional enrichment
+  dge <-  dge_list[[2]]
+  gse_list <- foreach(dge = dge_list) %do%{
+    gse_res <- gse_omnibus(
+      feature_names = dge$results$gene_name,
+      p = dge$results$FDR,
+      fc = dge$results$logFC,
+      fc_thrs = 0.5,
+      return_sets = c('up', 'down'),
+      gmt_files = gmt_files_symbols,
+      
+      run_enricher = TRUE,
+      run_enrichGO = FALSE,
+      run_enrichKEGG = FALSE,
+      run_enrichReactome = FALSE,
+      
+      run_GSEA = FALSE,
+      run_gseGO = FALSE,
+      run_gseKEGG = FALSE,
+      run_gseReactome = FALSE,
+      
+      go_simplify_p = 0.05,
+      args_gse = list(minGSSize = 10, 
+                      maxGSSize = 250, 
+                      pvalueCutoff = 1,
+                      BPPARAM = BiocParallel::MulticoreParam(1)
+      ),
+      args_enricher = list(minGSSize = 10, 
+                           maxGSSize = 250, 
+                           pvalueCutoff = 1, 
+                           qvalueCutoff = 1
+      )
+      
+    )
+    
+    return(gse_res)
+    
+  }
+  names(gse_list) <- names(dge_list)
+  saveRDS(gse_list, file = file.path(params$output_dir,paste0('gse_omnibus_ora-',clvar,'.rds')))
+}
+gse_list <- readRDS(file.path(params$output_dir, paste0('gse_omnibus_ora-',clvar,'.rds')))
+ora_collections <- list(
+  enricher = names(gmt_files_symbols)
+)
+
+``` 
+
+
+
+### Download results
+
+
+<!-- Write ORA results to xlsx file -->
+```{r write-ora_list-xlsx}
+# File name summary
+rmd_file <- current_input()
+if(is.null(rmd_file))
+  rmd_file <- 'tmp'
+
+file_xlsx_list <- list()
+sr <- names(ora_collections)[1]
+gc <- ora_collections[[sr]][1]
+for(sr in names(ora_collections)) {
+  file_xlsx_list[[sr]] <- list()
+  for(gc in ora_collections[[sr]]) {
+    # Generate file
+    file_xlsx <- file.path('./docs/file', 
+                           rmd_file, 
+                           paste0('ora.', tolower(sr), '_', tolower(gc), '.xlsx')
+                           )
+    file_xlsx_list[[sr]][[gc]] <- file_xlsx
+    dir.create(dirname(file_xlsx), recursive = TRUE, showWarnings = FALSE)
+    
+    # Generate workbook
+    wb <- createWorkbook()
+    for(i in names(gse_list)) {
+      if(gc != sr){
+        for(direction in names(gse_list[[i]][[sr]])) {
+          addWorksheet(wb, paste0(i,"-",direction))
+          if(!is.null(gse_list[[i]][[sr]][[direction]][[gc]])) {
+            res <- gse_list[[i]][[sr]][[direction]][[gc]]@result
+            writeData(wb, paste0(i,"-",direction), res)
+          }
+        }
+      }
+      if(gc == sr){
+        for(direction in names(gse_list[[i]][[sr]])) {
+          addWorksheet(wb, paste0(i,"-",direction))
+          if(!is.null(gse_list[[i]][[sr]][[direction]])) {
+            res <- gse_list[[i]][[sr]][[direction]]@result
+            writeData(wb, paste0(i,"-",direction), res)
+          }
+        }
+      }
+    }
+    saveWorkbook(wb, file_xlsx, TRUE)
+  }
+}
+```
+
+<!-- Change gse_list names after writing to xlsx -->
+```{r change-ora-names}
+if(exists('comp_list_description')) {
+  comp_names <- comp_list_description$comparison_long %>% 
+    set_names(comp_list_description$comparison)
+  comp_list_backup <- comp_list
+  names_gse_list_backup <- names(gse_list)
+  
+  names(comp_list) <- comp_names[names(comp_list)]
+  names(gse_list) <- comp_names[names(gse_list)]
+}
+```
+
+<!-- Write links to download ORA results -->
+```{r write-links-ora, echo = TRUE}
+for(sr in names(file_xlsx_list)) {
+  for(gc in names(file_xlsx_list[[sr]])) {
+    file_xlsx <- gsub("docs/", "", file_xlsx_list[[sr]][[gc]])
+    if(sr == 'enricher') {
+      cat(paste0("- [**Over-enrichment analysis: ", gc, "**](", file_xlsx, ")"), '\n\n')
+    }
+  }
+}
+```
+
+
+
+
+### Summary of results
+```{r ora-summary-fdr}
+res <- foreach(i = names(gse_list), .combine = rbind) %do% {
+  foreach(sr = names(ora_collections), .combine = rbind) %do% {
+    
+    foreach(gc = ora_collections[[sr]], .combine = rbind) %do% {
+      if(sr == 'enricher') {
+        n_abs <- if(!is.null(gse_list[[i]][[sr]][['abs']][[gc]])) {
+          gse_list[[i]][[sr]][['abs']][[gc]]@result %>% 
+            filter(p.adjust <= 0.05) %>% nrow
+        } else {
+          0
+        }
+        n_down <- if(!is.null(gse_list[[i]][[sr]][['down']][[gc]])) {
+          gse_list[[i]][[sr]][['down']][[gc]]@result %>% 
+            filter(p.adjust <= 0.05) %>% nrow
+        } else {
+          0
+        }
+        n_up <- if(!is.null(gse_list[[i]][[sr]][['up']][[gc]])) {
+          gse_list[[i]][[sr]][['up']][[gc]]@result %>% 
+            filter(p.adjust <= 0.05) %>% nrow
+        } else {
+          0
+        }
+      }
+            if(sr == 'enrichGO') {
+        n_abs <- if(!is.null(gse_list[[i]][[sr]][['abs']][[gc]])) {
+          gse_list[[i]][[sr]][['abs']][[gc]]@result %>% 
+            filter(p.adjust <= 0.05) %>% nrow
+        } else {
+          0
+        }
+        n_down <- if(!is.null(gse_list[[i]][[sr]][['down']][[gc]])) {
+          gse_list[[i]][[sr]][['down']][[gc]]@result %>% 
+            filter(p.adjust <= 0.05) %>% nrow
+        } else {
+          0
+        }
+        n_up <- if(!is.null(gse_list[[i]][[sr]][['up']][[gc]])) {
+          gse_list[[i]][[sr]][['up']][[gc]]@result %>% 
+            filter(p.adjust <= 0.05) %>% nrow
+        } else {
+          0
+        }
+      }
+        
+        
+        c(
+          Comparison = i,
+          `Collection` = gc,
+          `Total` = n_abs,
+          `Supressed` = n_down,
+          `Activated` = n_up
+        )
+      
+    }
+  }
+}
+
+res <- res %>% data.frame(check.names = F)
+
+```
+
+#### Table
+```{r ora-summary-fdr-table}
+res %>% 
+  data.frame(check.names = F) %>% 
+  kbl(caption = 'Number of gene sets at FDR < 0.05',
+              row.names = F) %>%
+  kable_paper(bootstrap_options = c("striped", "hover", "condensed"), 
+              full_width = F) %>%
+  column_spec(1, bold = TRUE)
+```
+
+#### Barplot
+```{r gse-summary-fdr-barplot, fig.asp = 1.3}
+res_plot <- res %>% 
+  pivot_longer(cols = c('Total', 'Supressed', 'Activated'), names_to = 'Direction', values_to = 'Count') %>% 
+  mutate(
+    comb_names = paste(Comparison, Collection),
+    Count = as.numeric(Count),
+    Comparison = gsub("-over-", " over\n", Comparison),
+    Comparison = gsub(" corrected", "\ncorrected", Comparison)
+  ) %>% 
+  ggplot(aes(Collection, Count, fill = Direction)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  facet_grid(rows = vars(Comparison)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  scale_fill_manual(values = c(Supressed = '#74add1', 
+                               Activated = '#f46d43',
+                               Total = 'grey80')
+  ) +
+  labs(x = '', fill = '') +
+  theme_facet +
+  theme(
+    axis.line = element_blank(),
+    axis.ticks = element_line(linewidth = one_pt/4, color = 'black'),
+    strip.text = element_text(size = 5)
+    
+  )
+
+
+subchunkify(
+  print(res_plot), 
+  fig.width = 3.5, 
+  fig.height = 3.5*0.4,
+  dpi = 600,
+  prefix = 'gse-summary-fdr-barplot'
+  # suffix = tolower(i) %>% gsub(" ", "-", .)
+)
+cat("\n\n")
+```
+
+
+### Dotplots
+
+<!-- # Subchunkify dotplots -->
+<!-- ## chunk options need to be set to echo=FALSE, results='asis' -->
+<!-- ## Cause results='asis',we must use raw HTML to print text and headings -->
+```{r ora-dotplot, echo=FALSE, results='asis'}
+knitr::opts_knit$set(
+  base.dir = "docs"
+  )
+
+use_linewidth <- 1/2.141959
+root_section_number <- 6.3
+section_n <- 1
+subsection_n <- 1
+n_top <- 10
+
+for(i in names(gse_list)) {
+  h_section_number <- paste(root_section_number, section_n, sep=".")
+  cat("<h5> <span class=\"header-section-number\">",h_section_number,"</span>Comparison", i, "</h5>\n\n") #Caue results='asis',we must use raw HTML
+  section_n <- section_n + 1
+  for(sr in names(ora_collections)) {
+    for(gc in ora_collections[[sr]]) {
+      if(sr == 'enricher') {
+        
+        if(!is.null(gse_list[[i]][[sr]][["up"]][[gc]])) {
+          x_up <- gse_list[[i]][[sr]][["up"]][[gc]]@result %>% 
+            filter(p.adjust <= 0.05) %>% 
+            mutate(
+              Description = clean_msigdb_names(Description),
+              Direction = 'Up'
+            ) %>% 
+            head(n_top)
+        } else {
+          x_up <- data.frame()
+        }
+        if(!is.null(gse_list[[i]][[sr]][["down"]][[gc]])) {
+          x_down <- gse_list[[i]][[sr]][["down"]][[gc]]@result %>% 
+            filter(p.adjust <= 0.05) %>% 
+            mutate(
+              Description = clean_msigdb_names(Description),
+              Direction = 'Down'
+            ) %>% 
+            head(n_top)
+        } else {
+          x_down <- data.frame()
+        }
+        if(!is.null(gse_list[[i]][[sr]][["abs"]][[gc]])) {
+          x_abs <- gse_list[[i]][[sr]][["abs"]][[gc]]@result %>% 
+            filter(p.adjust <= 0.05 & !(ID %in% x_up$ID) & !(ID %in% x_down$ID)) %>% 
+            mutate(
+              Description = clean_msigdb_names(Description),
+              Direction = 'Abs'
+            )  %>% 
+            head(n_top)
+        } else {
+          x_abs <- data.frame()
+        }
+        
+        x <- rbind(x_up, x_down, x_abs)
+      }
+      
+      if(sr == 'enrichGO') {
+        
+        if(!is.null(gse_list[[i]][[sr]][["up"]][[gc]])) {
+          x_up <- gse_list[[i]][[sr]][["up"]][[gc]]@result %>% 
+            filter(p.adjust <= 0.05) %>% 
+            mutate(
+              Description = clean_msigdb_names(Description),
+              Direction = 'Up'
+            ) %>% 
+            filter(simplify) %>% 
+            head(n_top)
+        } else {
+          x_up <- data.frame()
+        }
+        if(!is.null(gse_list[[i]][[sr]][["down"]][[gc]])) {
+          x_down <- gse_list[[i]][[sr]][["down"]][[gc]]@result %>% 
+            filter(p.adjust <= 0.05) %>% 
+            mutate(
+              Description = clean_msigdb_names(Description),
+              Direction = 'Down'
+            ) %>% 
+            filter(simplify) %>% 
+            head(n_top)
+        } else {
+          x_down <- data.frame()
+        }
+        if(!is.null(gse_list[[i]][[sr]][["abs"]][[gc]])) {
+          x_abs <- gse_list[[i]][[sr]][["abs"]][[gc]]@result %>% 
+            filter(p.adjust <= 0.05 & !(ID %in% x_up$ID) & !(ID %in% x_down$ID)) %>% 
+            filter(simplify) %>% 
+            mutate(
+              Description = clean_msigdb_names(Description),
+              Direction = 'Abs'
+            )  %>% 
+            head(n_top)
+        } else {
+          x_abs <- data.frame()
+        }
+        
+        x <- rbind(x_up, x_down, x_abs)
+      }
+      
+      if(nrow(x) > 0) {
+        h_subsection_number <- paste(h_section_number, subsection_n, sep=".")
+        cat("<h6> <span class=\"header-section-number\">",h_subsection_number,"</span>Collection", gc, "</h6>\n\n") #Caue results='asis',we must use raw HTML
+        subsection_n <- subsection_n + 1
+        
+        x %<>% 
+          mutate(
+            log10P = -log10(p.adjust),
+            Description = fct_reorder(Description, p.adjust, .desc = TRUE),
+            Direction = factor(Direction, levels = c('Up', 'Down', 'Abs'))
+            )
+        
+        res <- x %>% 
+          ggplot(aes(x = log10P, y = Description, 
+                     color = Direction,
+                     size = GeneProp)) +
+          geom_point(pch = 16, alpha = 0.8) + 
+          facet_grid(rows = vars(Direction), scale = 'free_y', space = 'free_y') +
+          scale_y_discrete(labels = default_labeller(50)) +
+          scale_color_manual(values = c(Up = 'firebrick', Down = 'dodgerblue', Abs = 'grey50')) +
+          scale_size_continuous(range=c(0.3, 2.5)) +
+          scale_x_continuous(expand = expansion(mult = c(0.05, 0.05))) +
+          labs(
+            x = expression(paste("-lo", g[10],"(Adjusted P value)")),
+            y = '',
+            size = 'Gene proportion'
+          ) +
+          theme(
+            panel.border = element_rect(color = "black", fill = NA, size = use_linewidth/2),
+            
+            axis.line = element_blank(),
+            axis.ticks = element_line(color = "black", linewidth = use_linewidth/2),
+            axis.text.y = element_text(size = 4),
+            axis.text.x = element_text(size = 4),
+            
+            legend.text = element_text(size = 4), 
+            legend.title = element_text(size = 4),
+            legend.key.width = unit(0.2, "cm")
+          )
+        
+        subchunkify(res, 
+                    fig.width = 3.5, 
+                    fig.height = (3.5*0.3) + nrow(x)*0.10,
+                    dpi = 600,
+                    prefix = paste0('ora-dotplot'),
+                    suffix = paste0(tolower(i) %>% gsub(" ", "-", .), '_', sr, '_', gc) )
+        cat("\n\n")
+      }
+    }
+  }
+}
+
+ cat("\n\n")
+```
+
+

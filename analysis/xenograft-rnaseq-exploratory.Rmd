@@ -1,0 +1,393 @@
+---
+title: Analysis of CTCs from HT29 and HT29.Li_M2 model
+subtitle: Explorative analysis of human reads
+author: Francesc Castro-Giner
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  se_path: ./data/rnaseq/HT29_Li.M2/se_hs.rds,./data/rnaseq/HT29/se_hs.rds
+  group: anatomical_origin
+  min_counts: 5
+  min_present_prop: 0.70
+  msigdb_dir: ./data/resources/MSigDB
+  msigdb_vs: v2026.1.Hs
+  ann_vars: anatomical_origin,sample_type,n_cells,detected,sum,subsets_Mito_percent,subsets_Ribo_percent,mouse_id,cc_g1_score_cy,cc_s_score_cy,cc_g2m_score_cy,donor
+  run_cl_mk: FALSE
+---
+
+## Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', dpi = 600, dev = c("png", "pdf"), engine.opts = list(bash = "-l"), fig.width = 3.5, fig.asp = 0.618)
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(showtext)
+library(foreach)
+library(DT)
+library(knitr)
+library(kableExtra)
+library(cowplot)
+library(colorblindr)
+library(RColorBrewer)
+library(ggbeeswarm)
+library(ggrepel)
+library(magrittr)
+library(openxlsx)
+library(arsenal)
+
+library(SummarizedExperiment)
+library(edgeR)
+library(DESeq2)
+library(scuttle)
+library(scran)
+library(pheatmap)
+library(PCAtools)
+library(org.Hs.eg.db)
+library(ComplexHeatmap)
+library(circlize)
+library(GSVA)
+library(babelgene)
+library(dynamicTreeCut)
+library(dendextend)
+```
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+
+Set color palettes
+```{r, echo = FALSE}
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+Load custom functions
+```{r load-functions}
+source('./code/R-functions/dge_wrappers.r')
+source('./code/R-functions/dge_report.r')
+source('./code/R-functions/gse_omnibus.r')
+source('./code/R-functions/gse_report.r')
+source('./code/R-functions/subchunkify.R')
+source('./code/R-functions/pairwise_terms_jc.r')
+source('./code/R-functions/eigencorval.R')
+clean_msigdb_names <- function(x) x %>% gsub('REACTOME_', '', .) %>% gsub('WP_', '', .) %>% gsub('BIOCARTA_', '', .) %>% gsub('KEGG_', '', .) %>% gsub('PID_', '', .) %>% gsub('GOBP_', '', .) %>% gsub('_', ' ', .)
+```
+
+Define additional functions
+```{r add-functions}
+clean_sample_alias <- function(x) 
+  gsub('o[0-9]*_[0-9]*-|_gDNA.*', '', x) %>% gsub(".*-MS", "MS", .) %>% gsub("_S[0-9]+_R[0-9].*", "", .) %>% gsub('__STARpass1', '', .) %>% gsub(".k2report", "", .) %>% gsub(".*-|.disambiguated.*", "", .)
+```
+
+Load MSigDB gene sets
+```{r load-msigdb}
+gmt_files_symbols <- list(
+  msigdb.h = paste0(params$msigdb_dir, '/', params$msigdb_vs, '/h.all.', params$msigdb_vs, '.symbols.gmt'),
+  msigdb.c2.cp = paste0(params$msigdb_dir, '/', params$msigdb_vs, '/c2.cp.', params$msigdb_vs, '.symbols.gmt')
+)
+```
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+Process param variables
+```{r process-params}
+se_files <- strsplit(params$se_path, ",") %>% unlist
+```
+
+## Data wrangling
+
+Load SE object and remove outliers
+```{r dw-load-se}
+# Load files
+se_list <- foreach(i=se_files) %do% {
+  ise <- readRDS(i)
+  rowData(ise)$mean <- NULL
+  rowData(ise)$detected <- NULL
+  ise$collection_time <- NULL
+  ise$mouse_id <- as.character(ise$mouse_id)
+  # ise$order_id_b_fabric <- as.character(ise$order_id_b_fabric)
+  # ise$ctc_cluster_id <- as.character(ise$ctc_cluster_id)
+  ise$collection_date <- NULL
+  ise$ctc_cluster_size <- as.numeric(ise$ctc_cluster_size)
+  ise$outlier_high_subsets_Mito_percent <- as.logical(ise$outlier_high_subsets_Mito_percent)
+  ise$outlier_low_lib_size <- as.logical(ise$outlier_low_lib_size)
+  ise$outlier_low_n_features <- as.logical(ise$outlier_low_n_features)
+  ise
+}
+
+# Define row intersection
+use_genes <- foreach(i=se_list) %do% {
+  rownames(i)
+} %>% unlist
+use_genes <- table(use_genes) %>% data.frame %>% 
+  filter(Freq == length(se_files)) %>% pull(use_genes) %>% as.character
+
+# Combine SE
+se <- se_list[[1]][use_genes,]
+if(length(se_list) > 1) {
+  for (i in 2:length(se_files)) {
+    ise <- se_list[[i]]
+    new_colData <- bind_rows(colData(se) %>% data.frame, 
+                             colData(ise) %>% data.frame) %>% 
+      DataFrame
+    new_counts <- cbind(assay(se, 'counts'), assay(ise[rownames(se),], 'counts'))
+    se <- SummarizedExperiment(
+      assays = SimpleList(counts = new_counts),
+      colData = new_colData,
+      rowData = rowData(se)
+    )
+  }
+}
+
+# Update metrics
+se <- addPerFeatureQCMetrics(
+  se,
+  threshold = 3
+  )
+
+colData(se) %<>% data.frame %>% 
+  mutate(
+    total_features_o = nrow(se),
+    pct_detected_o = 100*detected/total_features_o
+  ) %>% DataFrame
+
+
+# Rename anatomical origin
+se$anatomical_origin_grouped <- case_when(
+  se$anatomical_origin == "heart_puncture" ~ "post_liver",
+  se$anatomical_origin == "inferior_vena_cava_posthepatic" ~ "post_liver",
+  se$anatomical_origin == "portal_vein" ~ "pre_liver",
+  se$anatomical_origin == "right_atrium" ~ "post_liver",
+  se$anatomical_origin == "thoracic_inferior_vena_cava" ~ "post_liver",
+  TRUE ~ as.character(se$anatomical_origin)
+)
+```
+
+Cell cycle annotation with cyclone, before filtering low abundance genes: *Users should not filter out low-abundance genes before applying cyclone. Even if a gene is not expressed in any cell, it may still be useful for classification if it is phase-specific.*
+```{r dw-cc-cyclone}
+cc.pairs <- readRDS(system.file("exdata", "human_cycle_markers.rds", 
+    package="scran"))
+res <- cyclone(se, cc.pairs)
+se$cc_phase_cy <- res$phases
+se$cc_g1_score_cy <- res$normalized.scores$G1
+se$cc_s_score_cy <- res$normalized.scores$S
+se$cc_g2m_score_cy <- res$normalized.scores$G2M
+cc_assignments_cy <- res
+```
+
+Filtering out low-abundance features. Keeping those features with at least 5 counts in at least 50% of samples of the smallest group.
+```{r dw-subset-feature-abundance-hs}
+# Not done: it is done at DGE level, for each comparison
+use_rows <- filterByExpr(se, group=colData(se)[[params$group]], min.count = 5, min.total.count = 15, min.prop = 0.5)
+se <- se[use_rows,]
+```
+
+TMM normalization
+```{r dw-tmm-hs}
+norm_method <- "TMM"
+exprs_mat_for_norm <- assay(se, 'counts')
+norm_factors <- calcNormFactors(exprs_mat_for_norm, method = norm_method)
+lib_size <- colSums(exprs_mat_for_norm)/10^6
+se$size_factor <- (norm_factors * lib_size)
+se <- logNormCounts(se, size.factors =se$size_factor)
+se <- logNormCounts(se, size.factors =se$size_factor, log = FALSE)
+```
+
+CPM calculation
+```{r dw-cpm-hs}
+assay(se, 'cpm') <- edgeR::cpm(assay(se, 'normcounts'))
+assay(se, 'logcpm') <- edgeR::cpm(assay(se, 'normcounts'), log = TRUE)
+```
+
+
+
+### Additional objects
+Selection of HVG
+```{r conf-hvg}
+# Variance modelling
+fit_res <- modelGeneVar(se)
+fit_md <- metadata(fit_res)
+# Define highly variable genes
+hvg <- getTopHVGs(fit_res, prop = 0.1)
+hvg_top_n100 <- getTopHVGs(fit_res, n = 100)
+```
+
+Annotation variables and colors
+```{r conf-annot}
+ann_vars <- strsplit(params$ann_vars, ",") %>% unlist %>% 
+  intersect(., colData(se) %>% colnames)
+ann_df <- colData(se) %>% data.frame %>% 
+  dplyr::select(all_of(ann_vars))
+
+ann_colors <- foreach(i = ann_vars) %do% {
+  get_palette(i)
+}
+names(ann_colors) <- ann_vars
+ann_colors <- compact(ann_colors)
+```
+
+## PCA
+```{r pca-conf}
+use_rows <- hvg
+mat <- assay(se[use_rows,], 'logcounts')
+rownames(mat) <- make.names(rowData(se[use_rows,])$gene_name,unique = T)
+# Create annotation, keeping only variables with more than 1 unique value
+use_cols <- ann_df %>% dplyr::select(where(~n_distinct(.) > 1)) %>% colnames
+p <- PCAtools::pca(mat, metadata = colData(se) %>% data.frame %>% dplyr::select(all_of(use_cols)))
+```
+
+
+### Determine optimum number of PCs to retain
+Horn’s parallel analysis and elbow method
+```{r pca-elbow, fig.width = 3.1, fig.asp = 0.9}
+horn <- parallelPCA(mat)
+elbow <- findElbowPoint(p$variance)
+# horn$n
+# elbow
+screeplot(
+  p,
+  axisLabSize = 8, titleLabSize = 8,
+  components = getComponents(p, 1:20),
+  vline = c(horn$n, elbow)
+) +
+  geom_label(aes(x = horn$n + 0.5, y = 25, label = 'Horn\'s', vjust = -1),
+             size = geom_text_size) +
+  geom_label(aes(x = elbow + 0.5, y = 50, label = 'Elbow method', vjust = -1),
+             size = geom_text_size)
+```
+
+
+
+### Variable correlation
+Plot showing the correlation of PCs with sample-level variables. 
+```{r pca-eigencor-plot, fig.width = 10.2}
+use_rows <- hvg
+n_pc <- seq_len(horn$n)
+if(horn$n <= 2)
+  n_pc <- 1:3
+
+eigencor_res <- eigencorval(p, components = getComponents(p, n_pc), metavars = colnames(p$metadata))
+# Select variables correlated with PC1 and PC2
+col_vars <- colnames(eigencor_res$pvals)
+col_pc12 <- c(
+  col_vars[eigencor_res$pvals['PC1',]<0.05],
+  col_vars[eigencor_res$pvals['PC2',]<0.05]
+) %>% unique
+```
+
+```{r pca-eigencor-plot-curated, fig.width = 7.2}
+use_rows <- hvg
+n_pc <- seq_len(horn$n)
+if(horn$n <= 2)
+  n_pc <- 1:3
+
+selected_vars <- c(
+  `Anatomical origin` = 'anatomical_origin',
+  `CTC type` = 'sample_type',
+  `Number of cells` = 'n_cells',
+  `Detected genes` = 'detected',
+  `Total counts` = 'sum',
+  `Mitochondrial %` = 'subsets_Mito_percent',
+  `Ribosomal %` = 'subsets_Ribo_percent',
+  `Mouse ID` = 'mouse_id',
+  # `Cell cycle phase` = 'cc_phase_cy',
+  `G1 score` = 'cc_g1_score_cy',
+  `S score` = 'cc_s_score_cy',
+  `G2M score` = 'cc_g2m_score_cy'
+)
+
+p_curated <- p  
+p_curated$metadata <- p_curated$metadata %>% 
+  dplyr::rename(all_of(selected_vars))
+eigencor_res <- eigencorval(p_curated, components = getComponents(p_curated, n_pc), metavars = names(selected_vars))
+
+# Plot correlation
+eigencorplot(p_curated,
+             components = getComponents(p_curated, n_pc),
+             metavars = names(selected_vars),
+             fontCorval = 2,
+             cexCorval = 0.8,
+             main = 'PC sample variables correlation')
+
+
+```
+
+
+### Bi-plot PC1-PC2
+```{r pca-pc1-pc2-plot, fig.asp=0.8, fig.width = 2}
+i <- 'donor'
+use_palette <- ann_colors[[i]]
+res <- PCAtools::biplot(
+    p, 
+    x = "PC1",
+    y = "PC2",
+    colby = i, 
+    colkey = use_palette,
+    colLegendTitle = 'donor',
+    shape = params$group,
+    shapekey = get_shape(params$group),
+    shapeLegendTitle = 'Condition',
+
+    legendPosition = 'right',
+    pointSize = 1,
+    lab = NULL, 
+
+    ellipse = FALSE
+  ) +
+  xlim(c(-100, 50)) +
+  ylim(c(-45, 45)) +
+  theme_project
+
+print(res) 
+
+```
+
+### Bi-plot PC2-PC3
+```{r pca-pc2-pc3-plot, fig.asp=0.8, fig.width = 2}
+i <- 'donor'
+use_palette <- ann_colors[[i]]
+res <- PCAtools::biplot(
+    p, 
+    x = "PC2",
+    y = "PC3",
+    colby = i, 
+    colkey = use_palette,
+    colLegendTitle = 'donor',
+    shape = params$group,
+    shapekey = get_shape(params$group),
+    shapeLegendTitle = 'Condition',
+    legendPosition = 'right',
+    pointSize = 1,
+    lab = NULL, 
+    ellipse = FALSE
+  ) +
+  xlim(c(-100, 50)) +
+  ylim(c(-45, 45)) +
+  theme_project
+
+print(res) 
+
+```
+
+

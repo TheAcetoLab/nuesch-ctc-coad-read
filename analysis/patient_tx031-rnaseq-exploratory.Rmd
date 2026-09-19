@@ -1,0 +1,852 @@
+---
+title: Analysis post-mortem samples from patient 031
+subtitle: Explorative analysis of human reads
+author: Francesc Castro-Giner
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  se_path: ./data/rnaseq/patient/se.rds
+  output_dir: ./output/rnaseq/patient/exploratory
+  group: anatomical_origin_grouped
+  min_counts: 5
+  min_present_prop: 0.70
+  msigdb_dir: ./data/resources/MSigDB
+  msigdb_vs: v2026.1.Hs
+  ann_vars: anatomical_origin,anatomical_origin_grouped,sample_type,n_cells,detected,sum,subsets_Mito_percent,subsets_Ribo_percent,cc_phase_cy,cc_g1_score_cy,cc_s_score_cy,cc_g2m_score_cy
+  run_cl_mk: FALSE
+---
+
+## Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', dpi = 600, dev = c("png", "pdf"), engine.opts = list(bash = "-l"), fig.width = 3.5, fig.asp = 0.618)
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(showtext)
+library(foreach)
+library(DT)
+library(knitr)
+library(kableExtra)
+library(cowplot)
+library(colorblindr)
+library(RColorBrewer)
+library(ggbeeswarm)
+library(ggrepel)
+library(magrittr)
+library(openxlsx)
+library(arsenal)
+
+library(SummarizedExperiment)
+library(edgeR)
+library(DESeq2)
+library(scuttle)
+library(scran)
+library(pheatmap)
+library(PCAtools)
+library(org.Hs.eg.db)
+library(ComplexHeatmap)
+library(circlize)
+library(GSVA)
+library(babelgene)
+library(dynamicTreeCut)
+library(dendextend)
+
+library(GSEABase)
+library(PerformanceAnalytics)
+library(igraph)
+library(rstatix)
+library(ggpubr)
+```
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+
+Set color palettes
+```{r, echo = FALSE}
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+Load custom functions
+```{r load-functions}
+source('./code/R-functions/dge_wrappers.r')
+source('./code/R-functions/dge_report.r')
+source('./code/R-functions/gse_omnibus.r')
+source('./code/R-functions/gse_report.r')
+source('./code/R-functions/subchunkify.R')
+source('./code/R-functions/pairwise_terms_jc.r')
+source('./code/R-functions/eigencorval.R')
+
+
+
+clean_msigdb_names <- function(x) x %>% gsub('REACTOME_', '', .) %>% gsub('WP_', '', .) %>% gsub('BIOCARTA_', '', .) %>% gsub('KEGG_', '', .) %>% gsub('PID_', '', .) %>% gsub('GOBP_', '', .) %>% gsub('_', ' ', .)
+```
+
+Define additional functions
+```{r add-functions}
+clean_sample_alias <- function(x) 
+  gsub('o[0-9]*_[0-9]*-|_gDNA.*', '', x) %>% gsub(".*-MS", "MS", .) %>% gsub("_S[0-9]+_R[0-9].*", "", .) %>% gsub('__STARpass1', '', .) %>% gsub(".k2report", "", .) %>% gsub(".*-|.disambiguated.*", "", .)
+```
+
+Load MSigDB gene sets
+```{r load-msigdb}
+gmt_files_symbols <- list(
+  msigdb.c2.cp = paste0(params$msigdb_dir, '/', params$msigdb_vs, '/c2.cp.', params$msigdb_vs, '.symbols.gmt')
+)
+```
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+
+## Data wrangling
+
+### Human data
+Load SE object
+```{r dw-load-se-hs}
+se <- readRDS(params$se_path)
+
+# Rename anatomical origin
+se$anatomical_origin_grouped <- case_when(
+  se$anatomical_origin == "inferior_vena_cava_posthepatic" ~ "post_liver",
+  se$anatomical_origin == "portal_vein" ~ "pre_liver",
+  se$anatomical_origin == "right_atrium" ~ "post_liver",
+  se$anatomical_origin == "thoracic_inferior_vena_cava" ~ "post_liver",
+  TRUE ~ as.character(se$anatomical_origin)
+)
+se$anatomical_origin_grouped <- factor(se$anatomical_origin_grouped, levels = c("pre_liver", "post_liver"))
+```
+
+Subset by feature type. Using only protein coding features
+```{r dw-subset-feature-type, eval = TRUE}
+use_rows <- rowData(se)$gene_type %in% c('protein_coding')
+se <- se[use_rows,]
+```
+
+Cell cycle annotation with cyclone, before filtering low abundance genes: *Users should not filter out low-abundance genes before applying cyclone. Even if a gene is not expressed in any cell, it may still be useful for classification if it is phase-specific.*
+```{r dw-cc-cyclone}
+cc.pairs <- readRDS(system.file("exdata", "human_cycle_markers.rds", 
+    package="scran"))
+res <- cyclone(se, cc.pairs)
+se$cc_phase_cy <- res$phases
+se$cc_g1_score_cy <- res$normalized.scores$G1
+se$cc_s_score_cy <- res$normalized.scores$S
+se$cc_g2m_score_cy <- res$normalized.scores$G2M
+cc_assignments_cy <- res
+```
+
+
+Filtering out low-abundance features. Keeping those features with at least 5 counts in at least 50% of samples of the smallest group.
+```{r dw-subset-feature-abundance-hs}
+# Not done: it is done at DGE level, for each comparison
+use_rows <- filterByExpr(se, group=colData(se)[[params$group]], min.count = 5, min.total.count = 15, min.prop = 0.5)
+se <- se[use_rows,]
+```
+
+TMM normalization
+```{r dw-tmm-hs}
+norm_method <- "TMM"
+exprs_mat_for_norm <- assay(se, 'counts')
+norm_factors <- calcNormFactors(exprs_mat_for_norm, method = norm_method)
+lib_size <- colSums(exprs_mat_for_norm)/10^6
+se$size_factor <- (norm_factors * lib_size)
+se <- logNormCounts(se, size.factors =se$size_factor)
+se <- logNormCounts(se, size.factors =se$size_factor, log = FALSE)
+```
+
+CPM calculation
+```{r dw-cpm-hs}
+assay(se, 'cpm') <- edgeR::cpm(assay(se, 'normcounts'))
+assay(se, 'logcpm') <- edgeR::cpm(assay(se, 'normcounts'), log = TRUE)
+```
+
+Variance stabilizing transformations
+```{r dw-vst-hs, eval = FALSE}
+assay(se, 'vst') <- vst(assay(se, 'counts'), blind = TRUE)
+```
+
+
+### Additional objects
+Selection of HVG
+```{r conf-hvg}
+# Variance modelling
+fit_res <- modelGeneVar(se)
+fit_md <- metadata(fit_res)
+# Define highly variable genes
+hvg <- getTopHVGs(fit_res, prop = 0.1)
+hvg_top_n100 <- getTopHVGs(fit_res, n = 100)
+
+# HVG using gene names instead of ensembl IDs
+fit_res_ensg <- fit_res
+fit_res_ensg$ensg <- rownames(fit_res)
+fit_res_ensg <- fit_res_ensg %>% 
+  data.frame %>% 
+  left_join(rowData(se) %>% data.frame %>% rownames_to_column('ensg') %>% dplyr::select(ensg, gene_name)) %>% 
+  filter(!grepl("^ENSG", gene_name)) %>% 
+  column_to_rownames('ensg') %>% 
+  select(-gene_name)
+
+hvg_top_n100_f <- getTopHVGs(fit_res_ensg, n = 100)
+
+```
+
+Annotation variables and colors
+```{r conf-annot}
+ann_vars <- strsplit(params$ann_vars, ",") %>% unlist %>% 
+  intersect(., colData(se) %>% colnames)
+ann_df <- colData(se) %>% data.frame %>% 
+  dplyr::select(all_of(ann_vars))
+
+ann_colors <- foreach(i = ann_vars) %do% {
+  get_palette(i)
+}
+names(ann_colors) <- ann_vars
+ann_colors <- compact(ann_colors)
+```
+
+
+
+## Descriptive tables
+
+### By main condition
+```{r descriptive-table-main}
+
+use_formula <- as.formula(paste0(ann_vars, "~",  paste(setdiff(ann_vars, params$group), collapse = "+")))
+tab1 <- tableby(use_formula, 
+                data=colData(se) %>% data.frame,total = FALSE)
+summary(tab1)
+tab1 <- tableby(use_formula, 
+                data=colData(se) %>% data.frame,total = FALSE, strata=sample_type)
+summary(tab1)
+```
+
+
+## PCA
+```{r pca-conf}
+use_rows <- hvg
+mat <- assay(se[use_rows,], 'logcounts')
+rownames(mat) <- make.names(rowData(se[use_rows,])$gene_name,unique = T)
+# Create annotation, keeping only variables with more than 1 unique value
+use_cols <- ann_df %>% dplyr::select(where(~n_distinct(.) > 1)) %>% colnames
+p <- PCAtools::pca(mat, metadata = colData(se) %>% data.frame %>% dplyr::select(all_of(use_cols)))
+```
+
+
+### Determine optimum number of PCs to retain
+Horn’s parallel analysis and elbow method
+```{r pca-elbow, fig.width = 3.1, fig.asp = 0.9}
+horn <- parallelPCA(mat)
+elbow <- findElbowPoint(p$variance)
+# horn$n
+# elbow
+screeplot(
+  p,
+  axisLabSize = 8, titleLabSize = 8,
+  components = getComponents(p, 1:20),
+  vline = c(horn$n, elbow)
+) +
+  geom_label(aes(x = horn$n + 0.5, y = 25, label = 'Horn\'s', vjust = -1),
+             size = geom_text_size) +
+  geom_label(aes(x = elbow + 0.5, y = 50, label = 'Elbow method', vjust = -1),
+             size = geom_text_size)
+```
+
+
+
+### Variable correlation
+Plot showing the correlation of PCs with sample-level variables. 
+```{r pca-eigencor-plot, fig.width = 10.2}
+use_rows <- hvg
+n_pc <- seq_len(max(c(horn$n, elbow)))
+if(length(n_pc) <= 2)
+  n_pc <- 1:3
+
+eigencor_res <- eigencorval(p, components = getComponents(p, n_pc), metavars = colnames(p$metadata))
+
+```
+
+```{r pca-eigencor-plot-curated, fig.width = 7.2}
+use_rows <- hvg
+selected_vars <- c(
+  `Anatomical origin` = 'anatomical_origin',
+  `CTC type` = 'sample_type',
+  `Number of cells` = 'n_cells',
+  `Detected genes` = 'detected',
+  `Total counts` = 'sum',
+  `Mitochondrial %` = 'subsets_Mito_percent',
+  `Ribosomal %` = 'subsets_Ribo_percent',
+  `G1 score` = 'cc_g1_score_cy',
+  `S score` = 'cc_s_score_cy',
+  `G2M score` = 'cc_g2m_score_cy'
+)
+
+p_curated <- p  
+p_curated$metadata <- p_curated$metadata %>% 
+  dplyr::rename(all_of(selected_vars))
+eigencor_res <- eigencorval(p_curated, components = getComponents(p_curated, n_pc), metavars = names(selected_vars))
+
+# Plot correlation
+eigencorplot(p_curated,
+             components = getComponents(p_curated, n_pc),
+             metavars = names(selected_vars),
+             fontCorval = 2,
+             cexCorval = 0.8,
+             main = 'PC sample variables correlation')
+
+
+```
+
+
+## Hierarchical clustering
+```{r hclust-conf}
+max_pc <- ifelse(ncol(p$rotated) < 10, ncol(p$rotated), 10)
+dst <- dist(p$rotated[,1:max_pc], method = 'euclidean')
+hc <-  dst %>% hclust(method = 'ward.D2')
+dend <- hc %>% as.dendrogram()
+column_dend<- dend
+
+## Find Clusters
+clusters_original <- cutreeDynamic(hc, distM = as.matrix(dst),
+                                   minClusterSize = 5, method="tree")
+if(min(clusters_original) == 0) {
+  clusters_original <- clusters_original + 1
+}
+
+## Add clustering info to se
+
+
+cluster_info <- data.frame(
+  sample_alias = rownames(p$rotated)[order.dendrogram(dend)],
+  cluster = as.character(clusters_original[order.dendrogram(dend)]) %>% 
+    factor(levels = as.character(unique(clusters_original)))
+  )
+
+if(!is.null(se$cluster))
+  se$cluster <- NULL
+colData(se) <- colData(se) %>% data.frame %>% 
+  left_join(cluster_info) %>% 
+  mutate(torownames = sample_alias) %>%
+  column_to_rownames('torownames') %>% 
+  DataFrame
+
+ann_df$cluster <- colData(se)[rownames(ann_df), 'cluster'] %>% as.character
+```
+
+### Dendrogram
+Plot hierarchical clustering
+```{r hclust-plot, fig.width=7.2}
+## Sort clusters to the order of the dendrogram:
+clusters <- clusters_original[order.dendrogram(dend)]
+clusters_numbers <- unique(clusters) - (0 %in% clusters)
+n_clusters <- length(clusters_numbers)
+cluster_cols <- rainbow_hcl(n_clusters) %>% 
+  set_names(1:n_clusters)
+column_dend_colored <- dend %>% 
+         branches_attr_by_clusters(clusters, values = cluster_cols) 
+
+
+# Add color lables
+bar_var_sorted <- ann_df[[params$group]][order.dendrogram(dend)]
+bar_color <- get_palette(params$group)[bar_var_sorted]
+
+# Plot colored dendrogram
+plot(column_dend_colored)
+colored_bars(colors = bar_color, dend = column_dend_colored, rowLabels = params$group)
+
+# Add cluster color to annotation df
+ann_colors$cluster <- cluster_cols
+```
+
+### Heatmap 
+```{r hclust-heatmap-pca, fig.width=12.5, fig.asp=1}
+mat <- p$rotated[,1:max_pc] %>% t
+pheatmap(mat, 
+         clustering_distance_cols = "euclidean",
+         clustering_method = "ward.D2",
+         cluster_cols = TRUE,
+         annotation_col = ann_df[colnames(mat),] %>% select('anatomical_origin_grouped'), 
+         annotation_colors = ann_colors,
+         # fontsize_row = 6,
+         show_rownames = TRUE,
+         main = 'Heatmap of PC1-10.')
+```
+
+
+### Descriptive table
+```{r hclust-descriptive-table}
+use_formula <- as.formula(paste0(params$group, " ~ cluster"))
+tab1 <- tableby(use_formula, 
+                data=colData(se) %>% data.frame,total = FALSE)
+summary(tab1)
+tab1 <- tableby(use_formula, 
+                data=colData(se) %>% data.frame,total = FALSE, strata=sample_type)
+summary(tab1)
+
+use_formula <- as.formula(paste0("cluster", "~", paste(ann_vars, collapse = "+")))
+tab1 <- tableby(use_formula, 
+                data=colData(se) %>% data.frame,total = FALSE)
+summary(tab1)
+```
+
+
+## HVG heatmap 
+```{r hvg-exprs-heatmap-hvg-curated, fig.width=4.5, fig.asp=1.8}
+use_rows <- hvg_top_n100_f
+mat <- assay(se, 'logcounts')[use_rows,]
+rownames(mat) <- rowData(se)[use_rows, 'gene_name']
+zmat <- t(apply(mat, 1, scale, center = TRUE, scale = TRUE))
+colnames(zmat) <- colnames(mat)
+
+# Get sample clustering information
+clvar <- 'cluster'
+se$uclust <- colData(se)[[clvar]]
+
+# Column annotation
+use_annot <- ann_df[colnames(zmat),] %>% 
+  select(anatomical_origin_grouped)
+use_annot$cluster <- colData(se)[rownames(use_annot), 'uclust'] %>% as.character
+heatmap_col_annot_vars <- c('anatomical_origin_grouped')
+
+column_ha_colors <- lapply(heatmap_col_annot_vars, get_palette) %>% 
+    set_names(heatmap_col_annot_vars) %>% 
+    compact
+
+column_ha <-  HeatmapAnnotation(
+    df = use_annot %>% dplyr::select(all_of(heatmap_col_annot_vars)),
+    col = column_ha_colors,
+    annotation_name_gp = gpar(fontsize = 8),
+    simple_anno_size = unit(0.2, "cm"),
+    annotation_legend_param = list(
+      title_gp = gpar(fontsize = 8),
+      labels_gp = gpar(fontsize = 8)
+    )
+  )
+
+
+ht <- Heatmap(
+  mat,
+  name = 'Loadings',
+  row_names_gp = gpar(fontsize = 6),
+  show_row_names = FALSE,
+  show_column_names = FALSE,
+  show_column_dend = TRUE,
+  cluster_rows = TRUE,
+  # cluster_columns = hc,
+  
+  top_annotation = column_ha,
+  column_split = use_annot$cluster,
+  column_title = "Cluster %s",
+  column_title_gp = gpar(fontsize = 6),
+  
+  
+  # row_split = 2,
+  
+  heatmap_legend_param = list(
+    title_gp = gpar(fontsize = 6),
+    labels_gp = gpar(fontsize = 6),
+    ncol = 2
+  )
+)
+draw(
+  ht, 
+  annotation_legend_side = "bottom"
+)
+
+cat("\n\n")
+
+```
+
+## Cluster markers: differental expression
+```{r hclust-mk-conf}
+clvar <- 'cluster'
+se$uclust <- colData(se)[[clvar]]
+
+# Define comparisons
+x <- "1"
+comp_list <- foreach(x = levels(se$uclust)) %do%{
+  y <- setdiff( levels(se$uclust), x)
+  list(
+    colnames(se)[as.character(se$uclust) == x],
+    colnames(se)[as.character(se$uclust)%in% y]
+  ) %>% set_names(c(x, paste(y, collapse = "-")))
+}
+names(comp_list) <- levels(se$uclust)
+
+# RUN edgeR_dge and gse_omnibus
+if(params$run_cl_mk){
+  # Get ensembl annotation
+  ensembl <-  biomaRt::useEnsembl(biomart="genes", dataset="hsapiens_gene_ensembl",
+                                  mirror = 'useast')
+  gene_desc <- biomaRt::getBM(attributes=c('external_gene_name','description'),
+                              filters = 'external_gene_name',
+                              values = rowData(se)$gene_name, mart =ensembl) %>%
+    dplyr::rename('gene_name' = 'external_gene_name') %>%
+    unique
+  
+  gene_desc <- gene_desc[!duplicated(gene_desc$gene_name),]
+  # saveRDS(gene_desc, file = file.path(dirname(params$se_path), 'ensembl_gene_desc.rds'))
+  
+  # Run differential expression analysis using EdgeR QLF
+  use_comp <-  comp_list[[1]]
+  dge_list <- foreach(use_comp = comp_list) %do%{
+    se_cols <- se$sample_alias %in% unlist(use_comp)
+    use_se <- se[,se_cols]
+    use_se$group <- ifelse(
+      use_se$sample_alias %in% use_comp[[1]],
+      names(use_comp)[1],
+      names(use_comp)[2]
+    )
+    
+    if(is.null(use_comp$batch)) {
+      dge <- edgeR_dge(
+        use_se,
+        # Design configuration for differential expression
+        group_var =  'group',
+        group_sample = names(use_comp)[1],
+        group_ref = names(use_comp)[2],
+        design_formula = "~ group",
+        coef = 'last',
+        # Conversion from SingleCellExperiment/Summarized Experiment to DGEList
+        assay_to_DGEList = 'counts',
+        assay_to_row_filter = "counts",
+        # Feature filtering parameters
+        use_filterByExpr = TRUE,
+        min_counts = params$min_counts,
+        min_present_prop = params$min_present_prop,
+        # EdgeR workflow configuration
+        run_calcNormFactors = 'TMM',
+        estimateDisp_robust = TRUE,
+        estimateDisp_trend.method = "locfit",
+        glm_approach = "QLF",
+        # Output configuration
+        adjust_method = 'BH'
+      )
+    } else {
+      design_formula = paste0("~ ", use_comp$batch," + group")
+      dge <- edgeR_dge(
+        use_se,
+        # Design configuration for differential expression
+        group_var =  'group',
+        group_sample = names(use_comp)[1],
+        group_ref = names(use_comp)[2],
+        batch_vars = use_comp$batch,
+        design_formula = design_formula,
+        coef = 'last',
+        # Conversion from SingleCellExperiment/Summarized Experiment to DGEList
+        assay_to_DGEList = 'counts',
+        assay_to_row_filter = "counts",
+        # Feature filtering parameters
+        use_filterByExpr = TRUE,
+        min_counts = params$min_counts,
+        min_present_prop = params$min_present_prop,
+        # EdgeR workflow configuration
+        run_calcNormFactors = 'TMM',
+        estimateDisp_robust = TRUE,
+        estimateDisp_trend.method = "locfit",
+        glm_approach = "QLF",
+        # Output configuration
+        adjust_method = 'BH'
+      )
+    }
+    
+    # Add gene description
+    use_res <- dge$results %>%  left_join(., gene_desc, relationship = "many-to-many")
+    dge$results <- use_res %>% 
+      filter(!duplicated(feature)) %>% 
+      mutate(rownames = feature) %>% 
+      column_to_rownames('rownames')
+    
+    return(dge)
+  }
+  names(dge_list) <- names(comp_list)
+  saveRDS(dge_list, file = file.path(params$output_dir, paste0('dge-',clvar,'.rds')))
+}
+
+dge_list <- readRDS(file.path(params$output_dir, paste0('dge-',clvar,'.rds')))
+```
+
+<!-- Run template -->
+```{r knitr-template-rnaseq-deg-edger}
+# Configuration: variable evalauted in differential expression is by default included
+heatmap_col_annot_vars <- c('mouse_id', 'sample_type')
+
+# knit template: https://workflowr.github.io/workflowr/articles/wflow-07-common-code.html
+src <- knit_expand(
+  file = here::here("analysis/templates/rnaseq-deg-edger.Rmd")
+  )
+```
+`r knit(text = src)`
+
+## Cluster markers : ORA
+```{r hclust-mk-ora-conf}
+# Run ORA gse_omnibus
+if(params$run_cl_mk){
+  
+  # Run functional enrichment
+  dge <-  dge_list[[2]]
+  gse_list <- foreach(dge = dge_list) %do%{
+    gse_res <- gse_omnibus(
+      feature_names = dge$results$gene_name,
+      p = dge$results$FDR,
+      fc = dge$results$logFC,
+      fc_thrs = 0.5,
+      gmt_files = gmt_files_symbols,
+      
+      run_enricher = TRUE,
+      run_enrichGO = TRUE,
+      run_enrichKEGG = FALSE,
+      run_enrichReactome = FALSE,
+      
+      run_GSEA = FALSE,
+      run_gseGO = FALSE,
+      run_gseKEGG = FALSE,
+      run_gseReactome = FALSE,
+      
+      go_ontologies = c('BP', 'MF'),
+      go_simplify_p = 0.05,
+      args_gse = list(minGSSize = 10, 
+                      maxGSSize = 250, 
+                      pvalueCutoff = 1,
+                      BPPARAM = BiocParallel::MulticoreParam(1)
+      ),
+      args_enricher = list(minGSSize = 10, 
+                           maxGSSize = 250, 
+                           pvalueCutoff = 1, 
+                           qvalueCutoff = 1
+      )
+      
+    )
+    
+    return(gse_res)
+    
+  }
+  names(gse_list) <- names(dge_list)
+  saveRDS(gse_list, file = file.path(params$output_dir,paste0('gse_omnibus_ora-',clvar,'.rds')))
+}
+ora_list <- readRDS(file.path(params$output_dir, paste0('gse_omnibus_ora-',clvar,'.rds')))
+``` 
+
+```{r knitr-template-rnaseq-gse-ora}
+gse_list <- ora_list
+# knit template: https://workflowr.github.io/workflowr/articles/wflow-07-common-code.html
+src <- knit_expand(
+  file = here::here("analysis/templates/rnaseq-gse-omnibus-ora.Rmd")
+  )
+```
+`r knit(text = src)`
+
+### Dotplot curated
+```{r hclust-ora-dotplot-curated, fig.width = 4.2, fig.asp=0.72}
+gse_list <- ora_list
+
+x <- rbind(
+  gse_list$`2`$enricher$up$msigdb.c2.cp@result %>% mutate(group = 'Cluster 2'),
+  gse_list$`1`$enricher$up$msigdb.c2.cp@result %>% mutate(group = 'Cluster 1')
+) %>% 
+  filter(p.adjust <= 0.05) %>% 
+  mutate(
+    Description = clean_msigdb_names(Description),
+    log10P = -log10(p.adjust),
+    Description = fct_reorder(Description, log10P)
+  )
+
+
+
+x %>% 
+  ggplot(aes(x = log10P, y = Description, size = GeneProp, color = group)) +
+  geom_point(pch = 19) +
+  facet_grid(rows = vars(group), scales = 'free_y', space = 'free_y') +
+  scale_y_discrete(labels =  default_labeller(70)) +
+  labs(
+    y = '',
+    x = expression(paste("-lo", g[10],"(Adjusted P value)")),
+    size= 'Gene ratio',
+    caption = 'Gene sets with adjusted P value ≤ 0.05'
+  ) +
+  guides(color = 'none') +
+  scale_color_manual(values=get_palette('cluster')) +
+  scale_size_continuous(range=c(0.4, 2.5)) +
+  theme_facet +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, linewidth = linewidth_default),
+    strip.text.y = element_text(angle = 0, hjust = 0),
+
+    axis.line = element_blank(),
+    axis.ticks = element_line(color = "black", linewidth = linewidth_default),
+    axis.text.y = element_text(size = 4),
+    axis.text.x = element_text(size = 4),
+
+    legend.text = element_text(size = 4),
+    legend.title = element_text(size = 4),
+    legend.key.width = unit(0.2, "cm")
+  )
+```
+
+
+## Integration with Xenograft results
+```{r x-HT29_Li.M2-integration-cluster-conf}
+# Set the SummarizedExperiment object
+use_se <- se
+rownames(use_se) <- make.names(rowData(use_se)$gene_name, unique = TRUE)
+gsvaAnnotation(use_se) <- SymbolIdentifier("org.Hs.eg.db")
+
+# Selected gene sets from msigdb.c2.reactome
+selected_gsets <- list(
+  `1` = c('REACTOME_KERATINIZATION', 'REACTOME_DNA_STRAND_ELONGATION', 'REACTOME_DEVELOPMENTAL_CELL_LINEAGES', 'REACTOME_CHEMOKINE_RECEPTORS_BIND_CHEMOKINES', 'REACTOME_INTERFERON_SIGNALING'),
+  `2` = c('REACTOME_EUKARYOTIC_TRANSLATION_ELONGATION', 'REACTOME_CYTOSOLIC_TRNA_AMINOACYLATION', 'REACTOME_SLC_MEDIATED_TRANSPORT_OF_AMINO_ACIDS')
+)
+
+# Extract gene-sets from GMT file
+use_gsets <- readGMT(gmt_files_symbols$msigdb.c2.cp, valueType = 'list')
+use_gsets <- use_gsets[unlist(selected_gsets)]
+
+# Generate signatures based on CTC cluster markers. Here we use the results from differential expression between clusters identified by hierarchical clustering. We select only protein coding genes to match data from TCGA. For each group,  gene signature was defined as top-100 genes upregulated in each group (PValue < 0.05 and logFC > 0.5; genes ranked by sign(logFC) × -log10(PValue)). 
+
+topn <- 100
+p_thresh <- 0.05
+logfc_thresh <- 0.5
+gene_sets <- list()
+
+dge_list <- readRDS('./output/rnaseq/HT29_Li.M2/exploratory/dge-cluster_rmpc1.rds')
+use_dge <-  dge_list[[1]]
+gene_sets <- foreach(use_dge = dge_list) %do% {
+  use_dge$results |>
+    filter(logFC >= logfc_thresh & PValue < p_thresh) |> 
+    filter(gene_type == 'protein_coding') |> 
+    mutate(rank = sign(logfc_thresh) * -log10(PValue)) |>
+    arrange(desc(rank)) |> 
+    head(topn) |>
+    pull(gene_name)
+}
+names(gene_sets) <- paste0('Mouse cluster',names(dge_list))
+
+use_gsets <- c(use_gsets, gene_sets)
+
+# Run GSVA
+gsva_params <- gsvaParam(
+  assay(use_se, "logcpm"), 
+  use_gsets
+  )
+gsva_res <- gsva(gsva_params)
+
+# Extract GSVA scores and add to colData
+gsva_df <- gsva_res %>% t() %>%  data.frame %>% 
+    rownames_to_column('sample_alias') %>%
+  mutate(torow = sample_alias) %>% column_to_rownames('torow')
+colData(use_se) %<>% 
+  data.frame %>% 
+  rownames_to_column('torow') %>%
+  left_join(gsva_df, by = 'sample_alias') %>% 
+  column_to_rownames('torow') %>%
+  DataFrame
+```
+
+
+
+### Whisker plots
+```{r x-HT29_Li.M2-integration-whisker-cluster, fig.width=2.1, fig.asp=1.8}
+xvar <- 'uclust'
+
+use_data <- colData(use_se) %>% 
+  data.frame %>% 
+  pivot_longer(cols = starts_with(c("REACTOME", "module")), names_to = 'gset', values_to = 'gsva_score') %>% 
+  mutate(
+    gset = clean_msigdb_names(gset),
+    gset = gsub("^(.{10}[^ ]*)\\s", "\\1\n",gset)
+  )
+
+gset_test <- use_data %>% 
+  group_by(gset) %>% 
+  wilcox_test(data = ., formula = gsva_score ~ anatomical_origin_grouped) %>% 
+  adjust_pvalue(method = "BH") %>% 
+  arrange(p)
+
+
+
+my_comparisons <- combn(as.character(unique(use_data[[xvar]])), 2, simplify = FALSE)
+use_data %>%
+  mutate(gset = factor(gset, levels = gset_test$gset)) %>%
+  ggplot(aes(x = .data[[xvar]], y = gsva_score)) + 
+  geom_boxplot( aes(fill = .data[[xvar]]), outliers = FALSE, alpha = 0.7, width = 0.5, 
+                linewidth = linewidth_default,  median.linewidth = linewidth_default,
+                color = 'grey30') + 
+  # geom_hline(yintercept = 0, linetype = 'dashed', linewidth = linewidth_default) +
+  facet_wrap(~gset, ncol = 2, scales = 'free_y') +
+  # geom_jitter(width = 0.2, aes(color = .data[[params$group]])) +
+  geom_jitter(width = 0.2, alpha = 0.8, size = 0.5) +
+  # scale_color_manual(values = get_palette('anatomical_origin_grouped')) +
+  scale_fill_manual(values = get_palette(xvar)) +
+  labs(
+    x = '',
+    y = 'GSVA score'
+  ) +
+  guides(color = 'none', fill = 'none') +
+  theme_facet +
+  theme(
+    strip.text = element_text(size = 2.5)
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.2))) +
+  stat_compare_means(comparisons = my_comparisons, size = use_font_size * 0.352777778, bracket.size  = linewidth_default)
+
+```
+
+
+
+### Heatmap
+```{r x-HT29_Li.M2-integration-heatmap-cluster, fig.width=7.1}
+mat <- gsva_res
+rownames(mat) <- clean_msigdb_names(rownames(mat))
+
+# Column annotation
+column_ha <-  HeatmapAnnotation(
+    df = colData(use_se)[colnames(mat),] %>% data.frame %>% select(all_of(c('uclust'))),
+    col = list(
+      uclust = get_palette('uclust')
+    )
+  )
+
+htz <- Heatmap(
+  mat,
+  name= 'GSVA\nscore',
+  
+  row_names_side = 'left',
+  # show_row_dend = FALSE,
+  row_dend_side = "right",
+  row_names_gp = gpar(fontsize = 8),
+  column_names_gp = gpar(fontsize = 8),
+  
+  top_annotation = column_ha,
+  )
+
+draw(
+    htz, 
+    annotation_legend_side = "bottom"
+  )
+
+```
+
+
+

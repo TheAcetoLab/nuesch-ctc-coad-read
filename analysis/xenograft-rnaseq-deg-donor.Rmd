@@ -1,0 +1,917 @@
+---
+title:  Analysis of xenograft samples
+subtitle: Differential gene expression
+author: Francesc Castro-Giner
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+params:
+  date: '`r format(Sys.Date(), "%B %d, %Y")`'
+  se_files: ./data/rnaseq/HT29_Li.M2/se_hs.rds,./data/rnaseq/HT29/se_hs.rds
+  output_dir: ./output/rnaseq/xenograft/hs/differential_expression_edger/donor
+  group: condition
+  min_counts: 5
+  min_present_prop: 0.70
+  msigdb_dir: ./data/resources/MSigDB
+  msigdb_vs: v2026.1.Hs
+---
+
+## Load libraries, additional functions and data
+
+Setup environment
+```{r setup, include=TRUE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(results='asis', echo=TRUE, message=FALSE, warning=FALSE, error=FALSE, fig.align = 'center', dpi = 600, dev = c("png", "pdf"), engine.opts = list(bash = "-l"))
+
+options(stringsAsFactors = FALSE)
+
+use_seed <- 1100101
+set.seed(use_seed)
+
+dir.create(params$output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+Load packages
+```{r load-libraries}
+library(tidyverse)
+library(showtext)
+library(foreach)
+library(DT)
+library(knitr)
+library(kableExtra)
+library(cowplot)
+library(colorblindr)
+library(RColorBrewer)
+library(ggbeeswarm)
+library(ggrepel)
+library(magrittr)
+library(openxlsx)
+
+library(SummarizedExperiment)
+library(edgeR)
+library(DESeq2)
+library(scuttle)
+library(scran)
+library(pheatmap)
+library(PCAtools)
+library(org.Hs.eg.db)
+library(ComplexHeatmap)
+library(circlize)
+```
+
+Load ggplot theme
+```{r ggplot-theme}
+source("./configuration/rmarkdown/ggplot_theme.R")
+```
+
+Set color palettes
+```{r, echo = FALSE}
+source("./configuration/rmarkdown/color_palettes.R")
+```
+
+Load custom functions
+```{r load-functions}
+source('./code/R-functions/dge_wrappers.r')
+source('./code/R-functions/dge_report.r')
+source('./code/R-functions/gse_omnibus.r')
+source('./code/R-functions/gse_report.r')
+source('./code/R-functions/subchunkify.R')
+source('./code/R-functions/pairwise_terms_jc.r')
+source('./code/R-functions/eigencorval.R')
+```
+
+Load MSigDB gene sets
+```{r load-msigdb}
+gmt_files_symbols <- list(
+  msigdb.c2.cp = paste0(params$msigdb_dir, '/', params$msigdb_vs, '/c2.cp.', params$msigdb_vs, '.symbols.gmt')
+)
+```
+
+Clean files generated in previous runs
+```{r clean-files}
+rmd_file <- current_input()
+if(!is.null(rmd_file)) {
+  figures_dir <- file.path('./docs/figure',rmd_file)
+  if(dir.exists(figures_dir)) {
+    unlink(file.path(figures_dir, "*"))
+  }
+}
+```
+
+Process param variables
+```{r process-params}
+se_files <- strsplit(params$se_files, ",") %>% unlist
+```
+
+## Configure analyses
+
+### Data wrangling
+Load SE object and remove outliers
+```{r dw-load-se}
+# Load files
+se_list <- foreach(i=se_files) %do% {
+  ise <- readRDS(i)
+  rowData(ise)$mean <- NULL
+  rowData(ise)$detected <- NULL
+  ise$collection_time <- NULL
+  ise$mouse_id <- as.character(ise$mouse_id)
+  ise$collection_date <- NULL
+  ise$ctc_cluster_size <- as.numeric(ise$ctc_cluster_size)
+  ise$outlier_high_subsets_Mito_percent <- as.logical(ise$outlier_high_subsets_Mito_percent)
+  ise$outlier_low_lib_size <- as.logical(ise$outlier_low_lib_size)
+  ise$outlier_low_n_features <- as.logical(ise$outlier_low_n_features)
+  ise
+}
+
+# Define row intersection
+use_genes <- foreach(i=se_list) %do% {
+  rownames(i)
+} %>% unlist
+use_genes <- table(use_genes) %>% data.frame %>% 
+  filter(Freq == length(se_files)) %>% pull(use_genes) %>% as.character
+
+# Combine SE
+se <- se_list[[1]][use_genes,]
+if(length(se_list) > 1) {
+  for (i in 2:length(se_files)) {
+    ise <- se_list[[i]]
+    new_colData <- bind_rows(colData(se) %>% data.frame, 
+                             colData(ise) %>% data.frame) %>% 
+      DataFrame
+    new_counts <- cbind(assay(se, 'counts'), assay(ise[rownames(se),], 'counts'))
+    se <- SummarizedExperiment(
+      assays = SimpleList(counts = new_counts),
+      colData = new_colData,
+      rowData = rowData(se)
+    )
+  }
+}
+
+# Update metrics
+se <- addPerFeatureQCMetrics(
+  se,
+  threshold = 3
+  )
+
+colData(se) %<>% data.frame %>% 
+  mutate(
+    total_features_o = nrow(se),
+    pct_detected_o = 100*detected/total_features_o
+  ) %>% DataFrame
+
+
+# Rename anatomical origin
+se$anatomical_origin_grouped <- case_when(
+  se$anatomical_origin == "heart_puncture" ~ "post_liver",
+  se$anatomical_origin == "inferior_vena_cava_posthepatic" ~ "post_liver",
+  se$anatomical_origin == "portal_vein" ~ "pre_liver",
+  se$anatomical_origin == "right_atrium" ~ "post_liver",
+  se$anatomical_origin == "thoracic_inferior_vena_cava" ~ "post_liver",
+  TRUE ~ as.character(se$anatomical_origin)
+)
+```
+
+
+Subset by feature type. Using only protein coding features
+```{r dw-subset-feature-type, eval = TRUE}
+use_rows <- rowData(se)$gene_type %in% c('protein_coding')
+se <- se[use_rows,]
+```
+
+Filtering out low-abundance features. Keeping those features with at least 5 counts in at least 50% of samples of the smallest group.
+```{r dw-subset-feature-abundance, eval = FALSE}
+# Not done: it is done at DGE level, for each comparison
+use_rows <- filterByExpr(se, group=colData(se)[[params$group]], min.count = 5, min.total.count = 15, min.prop = 0.5)
+se <- se[use_rows,]
+```
+
+TMM normalization
+```{r dw-tmm}
+norm_method <- "TMM"
+exprs_mat_for_norm <- assay(se, 'counts')
+norm_factors <- calcNormFactors(exprs_mat_for_norm, method = norm_method)
+lib_size <- colSums(exprs_mat_for_norm)/10^6
+se$size_factor <- (norm_factors * lib_size)
+se <- logNormCounts(se, size.factors =se$size_factor)
+se <- logNormCounts(se, size.factors =se$size_factor, log = FALSE)
+```
+
+CPM calculation
+```{r dw-cpm}
+assay(se, 'cpm') <- edgeR::cpm(assay(se, 'normcounts'))
+assay(se, 'logcpm') <- edgeR::cpm(assay(se, 'normcounts'), log = TRUE)
+```
+
+Variance stabilizing transformations
+```{r dw-vst, eval = FALSE}
+assay(se, 'vst') <- vst(assay(se, 'counts'), blind = TRUE)
+```
+
+
+
+### Define of comparisons
+
+#### Process data
+Define initial comparisons without batch correction
+```{r conf-comparisons-unbathced}
+x <- colData(se) %>% data.frame
+comp_list <- list(
+  `29m2-o-29-pv-ctc_cluster` = list(
+    `HT29LiM2` = x %>% 
+      filter(donor == 'HT29_Li.M2' & anatomical_origin == 'portal_vein' & sample_type == 'ctc_cluster') %>% 
+      pull(sample_alias),
+    `H29` = x %>% 
+      filter(donor == 'HT29' & anatomical_origin == 'portal_vein' & sample_type == 'ctc_cluster') %>% 
+      pull(sample_alias)
+  )
+)
+
+comp_list_description <- data.frame(
+  comparison = names(comp_list),
+  comparison_long = c(
+    "HT29LiM2-over-HT29-PV-CTC_clusters"
+  )
+)
+
+```
+
+Add comparisons with batch correction. Only using batch levels with samples in both categories and comparisons with more than 2 levels of the batch variable
+```{r conf-comparisons-bathced}
+batch_var <- 'donor'
+batch_levels <- unique(x[,batch_var])
+for(cn in names(comp_list)) {
+  i <- comp_list[[cn]]
+  sample_batch_levels <- x %>% 
+    filter(sample_alias %in% i[[1]]) %>% 
+    pull(batch_var) %>% 
+    unique
+  ctrl_batch_levels <- x %>% 
+    filter(sample_alias %in% i[[2]]) %>% 
+    pull(batch_var) %>% 
+    unique
+  use_batch_levels <- intersect(sample_batch_levels, ctrl_batch_levels)
+  sample_samples <-  x %>% 
+    filter(sample_alias %in% i[[1]]) %>% 
+    filter(.[[batch_var]] %in% use_batch_levels) %>% 
+    pull(sample_alias)
+  ctrl_samples <-  x %>% 
+    filter(sample_alias %in% i[[2]]) %>% 
+    filter(.[[batch_var]] %in% use_batch_levels) %>% 
+    pull(sample_alias)
+  if(length(use_batch_levels) > 1 & 
+      length(sample_samples) > 0 & 
+      length(ctrl_samples) > 0) {
+    # Add comparison to list of comparison
+    res <- list(
+      sample = sample_samples,
+      ctrl = ctrl_samples,
+      batch = batch_var
+    )
+    names(res)[1:2] <- names(i)[1:2]
+    comp_list[[paste0(cn, '-', batch_var)]] <- res
+    # Add comparison long name description
+    new_desc <- comp_list_description %>% 
+      filter(comparison == cn) %>%
+      mutate(comparison_long = paste(comparison_long, 'batch', batch_var),
+             comparison = paste0(cn, '-', batch_var))
+    comp_list_description <- rbind(comp_list_description, new_desc)
+  }  
+}
+```
+
+
+#### Table of comparisons
+
+We filter comparisons with n < 3 samples in each group
+```{r table-comparisons}
+i = names(comp_list)[1]
+comp_df <- foreach(i = names(comp_list), .combine = rbind) %do% {
+  icomp <- comp_list[[i]]
+  data.frame(
+    comparison = i,
+    `Sample Group (n)` =  length(icomp[[1]]),
+    `Reference Group (n)` = length(icomp[[2]]),
+    check.names = FALSE
+  )
+}
+
+# filter comparisons were we have at least 3 samples in each group
+comp_df %<>% 
+  mutate(Evaluated = `Sample Group (n)` >= 3 & `Reference Group (n)` >= 3)
+kepp_comp <- comp_df %>% filter(Evaluated) %>% pull(comparison)
+comp_list <- comp_list[kepp_comp]
+
+# Add long names
+comp_df <- comp_df %>% left_join(comp_list_description) %>% 
+  mutate(comparison = comparison_long) %>%
+  dplyr::select(-comparison_long)
+
+comp_df %>%
+  datatable(., 
+            rownames = FALSE, 
+            filter = 'top', 
+            caption = 'List of comparisons for differential expression. Comparisons with n < 3 samples in each group won\'t be evaluated',
+            extensions = 'Buttons', 
+            options = list(
+              dom = 'Blfrtip',
+              buttons = c('csv', 'excel')
+            ))
+
+```
+
+## Data generation
+
+### Run differential expression analysis
+Get Ensembl gene info
+```{r de-ensembl, eval = FALSE}
+ensembl <-  biomaRt::useEnsembl(biomart="genes", dataset="hsapiens_gene_ensembl",
+                                mirror = 'useast')
+gene_desc <- biomaRt::getBM(attributes=c('external_gene_name','description'),
+                              filters = 'external_gene_name',
+                              values = rowData(se)$gene_name, mart =ensembl) %>%
+    dplyr::rename('gene_name' = 'external_gene_name') %>%
+    unique
+
+gene_desc <- gene_desc[!duplicated(gene_desc$gene_name),]
+saveRDS(gene_desc, file = file.path(dirname(params$output_dir), 'ensembl_gene_desc.rds'))
+```
+
+```{r de-ensembl-load, eval = FALSE}
+gene_desc <- readRDS(file = file.path(dirname(params$output_dir), 'ensembl_gene_desc.rds'))
+```
+
+Run differential expression analysis using EdgeR QLF
+```{r edgeR-QLF-run, eval = FALSE}
+use_comp <-  comp_list[[1]]
+dge_list <- foreach(use_comp = comp_list) %do%{
+  se_cols <- se$sample_alias %in% unlist(use_comp)
+  use_se <- se[,se_cols]
+  use_se$group <- ifelse(
+    use_se$sample_alias %in% use_comp[[1]],
+    names(use_comp)[1],
+    names(use_comp)[2]
+  )
+  
+  if(is.null(use_comp$batch)) {
+    dge <- edgeR_dge(
+      use_se,
+      # Design configuration for differential expression
+      group_var =  'group',
+      group_sample = names(use_comp)[1],
+      group_ref = names(use_comp)[2],
+      design_formula = "~ group",
+      coef = 'last',
+      # Conversion from SingleCellExperiment/Summarized Experiment to DGEList
+      assay_to_DGEList = 'counts',
+      assay_to_row_filter = "counts",
+      # Feature filtering parameters
+      use_filterByExpr = TRUE,
+      min_counts = params$min_counts,
+      min_present_prop = params$min_present_prop,
+      # EdgeR workflow configuration
+      run_calcNormFactors = 'TMM',
+      estimateDisp_robust = TRUE,
+      estimateDisp_trend.method = "locfit",
+      glm_approach = "QLF",
+      # Output configuration
+      adjust_method = 'BH'
+      )
+    } else {
+      design_formula = paste0("~ ", use_comp$batch," + group")
+      dge <- edgeR_dge(
+        use_se,
+        # Design configuration for differential expression
+        group_var =  'group',
+        group_sample = names(use_comp)[1],
+        group_ref = names(use_comp)[2],
+        batch_vars = use_comp$batch,
+        design_formula = design_formula,
+        coef = 'last',
+        # Conversion from SingleCellExperiment/Summarized Experiment to DGEList
+        assay_to_DGEList = 'counts',
+        assay_to_row_filter = "counts",
+        # Feature filtering parameters
+        use_filterByExpr = TRUE,
+        min_counts = params$min_counts,
+        min_present_prop = params$min_present_prop,
+        # EdgeR workflow configuration
+        run_calcNormFactors = 'TMM',
+        estimateDisp_robust = TRUE,
+        estimateDisp_trend.method = "locfit",
+        glm_approach = "QLF",
+        # Output configuration
+        adjust_method = 'BH'
+        )
+    }
+  
+  # Add gene description
+  use_res <- dge$results %>%  left_join(., gene_desc, relationship = "many-to-many")
+  dge$results <- use_res %>% 
+    filter(!duplicated(feature)) %>% 
+    mutate(rownames = feature) %>% 
+    column_to_rownames('rownames')
+  
+   return(dge)
+}
+
+names(dge_list) <- names(comp_list)
+
+# Save objects
+saveRDS(dge_list, file = file.path(params$output_dir, 'dge-edgeR_QLF.rds'))
+
+###########
+#   use_samples = NULL
+#   # Desing configuration for differential expression
+#   group_var = NULL
+#   group_sample = NULL
+#   group_ref = NULL
+#   numeric_covar = NULL
+#   batch_vars = NULL
+#   design_formula = NULL
+#   contrast = NULL
+#   coef = NULL
+#   # Conversion from SingleCellExpeiment to DGEList
+#   spike_normalization = FALSE
+#   assay_to_DGEList = 'counts'
+#   assay_to_row_filter = "tpm"
+#   use_colData = NULL
+#   use_rowData = NULL
+#   # Feature filtering parameters
+#   use_filterByExpr = TRUE
+#   min_counts = 1
+#   min_present_prop = 0.40
+#   # EdgeR workflow configuration
+#   run_calcNormFactors = 'TMM'
+#   estimateDisp_robust = FALSE
+#   estimateDisp_trend.method = "locfit"
+#   glmQLFit_robust = FALSE
+#   glm_approach = "QLF"
+#   # Output configuration
+#   adjust_method = 'BH'
+#   assays_from_SingleCellExperiment = NULL
+# # 
+#     object = use_se
+#     # Desing configuration for differential expression
+#     group_var =  'group'
+#     group_sample = names(use_comp)[1]
+#     group_ref = names(use_comp)[2]
+#     batch_vars = 'donor'
+#     design_formula = "~ donor + group"
+#     coef = 'last'
+#     # Conversion from SingleCellExperiment/Summarized Experiment to DGEList
+#     assay_to_DGEList = 'counts'
+#     assay_to_row_filter = "counts"
+#     # Feature filtering parameters
+#     use_filterByExpr = TRUE
+#     min_counts = params$min_counts
+#     min_present_prop = params$min_present_prop
+#     # EdgeR workflow configuration
+#     run_calcNormFactors = 'TMM'
+#     estimateDisp_robust = TRUE
+#     estimateDisp_trend.method = "locfit"
+#     glm_approach = "QLF"
+#     # Output configuration
+#     adjust_method = 'BH'
+
+```
+
+### Run functional enrichment
+```{r gse-run, eval = FALSE}
+dge_list <- readRDS(file.path(params$output_dir, 'dge-edgeR_QLF.rds'))
+dge <-  dge_list[[2]]
+
+gse_list <- foreach(dge = dge_list) %do%{
+  gse_res <- gse_omnibus(
+    feature_names = dge$results$gene_name,
+    p = dge$results$FDR,
+    fc = dge$results$logFC,
+    fc_thrs = 0.5,
+    gmt_files = gmt_files_symbols,
+    
+    run_enricher = TRUE,
+    run_enrichGO = TRUE,
+    run_enrichKEGG = FALSE,
+    run_enrichReactome = FALSE,
+    
+    run_GSEA = TRUE,
+    run_gseGO = TRUE,
+    run_gseKEGG = FALSE,
+    run_gseReactome = FALSE,
+    
+    go_ontologies = c('BP', 'MF'),
+    go_simplify_p = 0.05,
+    args_gse = list(minGSSize = 10, 
+                    maxGSSize = 250, 
+                    pvalueCutoff = 1,
+                    BPPARAM = BiocParallel::MulticoreParam(1)
+    ),
+    args_enricher = list(minGSSize = 10, 
+                         maxGSSize = 250, 
+                         pvalueCutoff = 1, 
+                         qvalueCutoff = 1
+    )
+    
+    )
+  
+   return(gse_res)
+
+}
+names(gse_list) <- names(dge_list)
+
+# Save objects
+saveRDS(gse_list, file = file.path(params$output_dir,'gse_omnibus-edgeR_QLF.rds'))
+```
+
+
+
+### Load data
+```{r dge-gse-load}
+dge_list <- readRDS(file = file.path(params$output_dir, 'dge-edgeR_QLF.rds'))
+gse_list <- readRDS(file = file.path(params$output_dir, 'gse_omnibus-edgeR_QLF.rds'))
+```
+
+
+
+## Differential Gene Expression
+<!-- Run template -->
+```{r knitr-template-rnaseq-deg-edger}
+# Configuration: variable evalauted in differential expression is by default included
+heatmap_col_annot_vars <- c('donor', 'anatomical_origin')
+
+# knit template: https://workflowr.github.io/workflowr/articles/wflow-07-common-code.html
+src <- knit_expand(
+  file = here::here("analysis/templates/rnaseq-deg-edger.Rmd")
+  )
+```
+`r knit(text = src)`
+
+
+## Functional enrichment : GSEA
+```{r gse-conf}
+gse_collections <- list(
+  GSEA = names(gmt_files_symbols)
+)
+```
+
+
+### Download results
+<!-- Write GSE results to xlsx file -->
+```{r write-gse_list-xlsx}
+# File name summary
+rmd_file <- current_input()
+if(is.null(rmd_file))
+  rmd_file <- 'tmp'
+
+file_xlsx_list <- list()
+for(sr in names(gse_collections)) {
+  file_xlsx_list[[sr]] <- list()
+  for(gc in gse_collections[[sr]]) {
+    # Generate file
+    file_xlsx <- file.path('./docs/file', 
+                           rmd_file, 
+                           paste0('gse_', tolower(sr), '_', tolower(gc), '.xlsx')
+                           )
+    file_xlsx_list[[sr]][[gc]] <- file_xlsx
+    dir.create(dirname(file_xlsx), recursive = TRUE, showWarnings = FALSE)
+    
+    # Generate workbook
+    wb <- createWorkbook()
+    for(i in names(gse_list)) {
+      addWorksheet(wb, i)
+      if(gc != sr){
+        if(!is.null(gse_list[[i]][[sr]][[gc]])) {
+          res <- gse_list[[i]][[sr]][[gc]]@result
+          writeData(wb, i, res)
+        }
+      }
+      if(gc == sr){
+        if(!is.null(gse_list[[i]][[sr]])) {
+          res <- gse_list[[i]][[sr]]@result
+          writeData(wb, i, res)
+        }
+      }
+    }
+    saveWorkbook(wb, file_xlsx, TRUE)
+  }
+}
+```
+
+<!-- Change gse_list names after writing to xlsx -->
+```{r change-gse-names}
+if(exists('comp_list_description')) {
+  comp_names <- comp_list_description$comparison_long %>% 
+    set_names(comp_list_description$comparison)
+  
+  comp_list_backup <- comp_list
+  names_gse_list_backup <- names(gse_list)
+  
+  names(comp_list) <- comp_names[names(comp_list)]
+  names(gse_list) <- comp_names[names(gse_list)]
+}
+```
+
+<!-- Write links to download GSE results -->
+```{r write-links-gse-2, echo = FALSE}
+for(sr in names(file_xlsx_list)) {
+  for(gc in names(file_xlsx_list[[sr]])) {
+    file_xlsx <- gsub("docs/", "", file_xlsx_list[[sr]][[gc]])
+    if(sr == 'GSEA') {
+      cat(paste0("- [**Gene set enrichment analysis: ", gc, "**](", file_xlsx, ")"), '\n\n')
+    }
+  }
+}
+```
+
+
+
+
+
+
+### Similarity Matrix
+<!-- Similarity matrix adn clsutering -->
+```{r 29m2-o-29-pv-ctc_cluster}
+comp <- "HT29LiM2-over-HT29-PV-CTC_clusters"
+p_thrs <- 0.01
+gse_collections <- list(
+  GSEA = "msigdb.c2.cp"
+)
+
+# Generate JC similarity matrix
+jc_matrix_list <- foreach(use_comp = comp) %do% {
+  data_gse <- foreach(sr = 'GSEA') %do% {
+    data_by_collection <- foreach(gc = gse_collections[[sr]], .combine = rbind)  %do% {
+      if(sr == 'GSEA') {
+        x <- gse_list[[use_comp]][[sr]][[gc]]@result %>% 
+          filter(p.adjust <= p_thrs) %>% 
+          arrange(p.adjust)
+      }
+      return(x)
+    }
+    return(data_by_collection)
+  }
+
+  data_gse <- purrr::compact(data_gse)
+  gse_df <- bind_rows(data_gse)
+  if(nrow(gse_df) > 1) {
+    gse_df <- bind_rows(data_gse) %>% 
+      mutate(
+        Description = clean_msigdb_names(Description),
+        Description = ifelse(grepl("^GO:", ID), paste0("GO:", Description), Description)
+      )
+
+    
+    # Data frame to plot
+    res_top <- gse_df %>%
+      mutate(
+        log.p.adjust = -log10(p.adjust),
+        Description = factor(Description)
+      )
+    
+    # Calculate jaccard similarity matrix
+    gset_core_enrichment <- foreach(i = levels(res_top$Description)) %do% {
+      res_top %>% filter(Description == i) %>% pull(core_enrichment) %>%
+        paste(collapse = '/') %>%
+        strsplit('/') %>% unlist %>% unique
+    }
+    names(gset_core_enrichment) <- levels(res_top$Description)
+    
+    use_terms <- res_top$Description %>% unique
+    jc_matrix <- pairwise_terms_jc(gset_core_enrichment[use_terms])
+  } else {
+    jc_matrix <- NULL
+  }  
+  return(jc_matrix)
+}
+
+names(jc_matrix_list) <- comp
+jc_matrix_list <- purrr::compact(jc_matrix_list)
+
+
+
+# Generate Clsutering and Dendrogram from JC similarity matrix
+library(dynamicTreeCut)
+use_mat <- jc_matrix_list[[comp]]
+dst <- dist(use_mat, method = 'euclidean')
+hc <-  dst %>% hclust(method = 'ward.D2')
+dend <- hc %>% as.dendrogram()
+column_dend <- dend
+hc_sample_order <- cbind(Description = hc$labels, hc_order = hc$order) %>% 
+  data.frame %>% 
+  mutate(hc_order = as.numeric(hc_order))
+## Find Clusters
+clusters_original <- cutreeDynamic(hc, 
+                                   distM = as.matrix(dst), method="hybrid", 
+                                   minClusterSize = 3)
+## Combine clustering info
+cluster_info <- data.frame(
+  Description = rownames(use_mat)[order.dendrogram(dend)],
+  cluster = as.character(clusters_original[order.dendrogram(dend)]) %>% 
+    factor(levels = as.character(unique(clusters_original)))
+  ) %>% 
+  left_join(., hc_sample_order, by = 'Description')
+```
+
+
+```{r 29m2-o-29-pv-ctc_cluster-jc-heatmap, fig.width=6.2, fig.height=5.5}
+library(NbClust)
+use_mat <- jc_matrix_list[[comp]]
+colnames(use_mat) <- colnames(use_mat) %>% clean_msigdb_names %>% ep_str_wrap(70)
+rownames(use_mat) <- rownames(use_mat) %>% clean_msigdb_names  %>% ep_str_wrap(70)
+
+# Define number of clusters
+use_max.nc <- ifelse(nrow(use_mat) <= 15, 5, round(nrow(use_mat) * 0.1))
+nbclust_res <- NbClust(data = NULL, diss = as.dist(1-use_mat), distance = NULL, 
+                       min.nc = 2, max.nc = use_max.nc, method = "ward.D",
+                       index = 'silhouette')
+
+
+n_split <- nbclust_res$Best.nc['Number_clusters']
+
+
+col_fun <- colorRamp2(seq(0, 1, length.out = 4), brewer.pal(4, "GnBu"))
+
+
+ht <- Heatmap(
+  use_mat,
+  name = 'Jaccard index',
+  column_split = n_split,
+  row_split = n_split,
+  column_title = NULL,
+  row_title = NULL,
+  row_names_gp = gpar(fontsize = 4),
+  col = col_fun,
+  show_column_dend = FALSE,
+  show_column_names = FALSE,
+  border = TRUE,
+  # top_annotation = ha_top,
+  heatmap_legend_param = list(title_gp = gpar(fontsize = 6),
+                              labels_gp = gpar(fontsize = 6)
+  ),
+  width = unit(3, "cm"),
+  
+  clustering_method_rows = "ward.D",
+  clustering_method_columns = "ward.D"
+) 
+
+draw(ht)
+
+
+ht_clusters_list <- foreach(i = row_order(ht)) %do% {
+  rownames(use_mat)[i]
+}
+names(ht_clusters_list) <- 1:length(ht_clusters_list)
+
+ht_clusters <- data.frame(
+  cluster = rep(names(ht_clusters_list), lengths(ht_clusters_list)),
+  Description = unlist(ht_clusters_list, use.names = FALSE)
+)
+
+```
+
+
+### Dotplot
+```{r curated-29m2-o-29-pv-ctc_cluster-gsea-dotplot}
+# Process groups
+group_levels_ord <- c(
+  "Translation & stress response",
+  "Coagulation & Complement cascade",
+  "Cytoskeleton, cell-cell adhesion",
+  "DNA damage repair & G2/M Checkpoints",
+  "G1/S transition & DNA synthesis",
+  "Cell cycle & RNA splicing",
+  "Cholesterol metabolism",
+  "Chromatin remodelling",
+  "DNA replication",
+  "Nuclear Export & mRNA transport",
+  "rRNA transcription",
+  "Histone modification",
+  "Mitotic spindle & chromatid segregation",
+  "Other"
+) %>% rev
+
+cluster_info <- nbclust_res$Best.partition %>% data.frame %>%
+  rownames_to_column('Description') %>%
+  dplyr::rename(cluster = '.') %>%
+  arrange(cluster)
+
+
+grouped_pathways <- gse_list[[comp]]$GSEA$msigdb.c2.cp@result %>%
+  filter(p.adjust <= p_thrs) %>%
+   mutate(
+    Description = clean_msigdb_names(Description) %>% ep_str_wrap(70)
+  ) %>%
+  left_join(cluster_info) %>%
+  mutate(
+    cluster_sign = paste(cluster, .sign, sep = '_')
+  ) %>% 
+  dplyr::select(Description, cluster, cluster_sign) %>% 
+  mutate(
+    group = case_when(
+      cluster_sign == "10_activated" ~ "Translation & stress response",
+      cluster_sign == "9_activated" ~ "Coagulation & Complement cascade",
+      cluster_sign == "1_activated" ~ "Cytoskeleton, cell-cell adhesion",
+      cluster_sign == "4_supressed" ~ "DNA damage repair & G2/M Checkpoints",
+      cluster_sign == "1_supressed" ~ "Cell cycle & RNA splicing",
+      cluster_sign == "3_supressed" ~ "G1/S transition & DNA synthesis",
+      cluster_sign == "7_supressed" ~ "Cholesterol metabolism",
+      cluster_sign == "6_supressed" ~ "Chromatin remodelling",
+      cluster_sign == "12_supressed" ~ "DNA replication",
+      cluster_sign == "5_supressed" ~ "Nuclear Export & mRNA transport",
+      cluster_sign == "8_supressed" ~ "rRNA transcription",
+      cluster_sign == "11_supressed" ~ "Histone modification",
+      cluster_sign == "2_supressed" ~ "Mitotic spindle & chromatid segregation",
+      TRUE ~ 'Other'
+    ),
+    group_rev = factor(group, levels = rev(group_levels_ord)),
+    group = factor(group, levels = group_levels_ord)
+  )
+
+
+
+x <- gse_list[[comp]]$GSEA$msigdb.c2.cp@result %>% 
+  filter(p.adjust <= p_thrs) %>%
+  mutate(
+    log10P = -log10(p.adjust),
+    Description = clean_msigdb_names(Description)
+    ) %>% 
+  left_join(grouped_pathways, by = 'Description')  %>% 
+  filter(!is.na(cluster)) %>%
+  mutate(
+    Description = ep_str_wrap(Description, 70),
+    # Description = fct_reorder(Description, hc_order),
+    Description = fct_reorder(Description, NES)
+    # cluster = fct_reorder(Description, NES)
+  )
+xlim <- c(-max(abs(x$NES)), max(abs(x$NES)))
+```
+
+
+```{r curated-29m2-o-29-pv-ctc_cluster-gsea-dotplot-named, fig.width = 7.2, fig.asp=1.2}
+x %>% 
+  ggplot(aes(x = NES, y = Description, size = log10P, color = NES)) +
+  geom_point(pch = 19) +
+  facet_grid(rows = vars(group_rev), scales = 'free_y', space = 'free_y') +
+  scale_y_discrete(labels =  default_labeller(60)) +
+  geom_vline(xintercept = 0, lty = 3) +
+  labs(
+    y = '',
+    size = expression(paste("-lo", g[10],"(Adjusted P value)")),
+    caption = 'Gene sets with adjusted P value ≤ 0.05'
+  ) +
+  scale_size_continuous(range=c(0.8, 2)) +
+  scale_color_gradient2(trans = "reverse") +
+  scale_x_continuous(expand = expansion(mult = c(0.20, 0.20)),
+                     limits = xlim) +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, linewidth = linewidth_default),
+    strip.text.y = element_text(angle = 0, hjust = 0),
+    
+    axis.line = element_blank(),
+    axis.ticks = element_line(color = "black", linewidth = linewidth_default),
+    axis.text.y = element_text(size = 4),
+    axis.text.x = element_text(size = 4),
+    
+    legend.text = element_text(size = 4), 
+    legend.title = element_text(size = 4),
+    legend.key.width = unit(0.2, "cm")
+  )
+```
+
+### Dotplot simplified
+
+```{r curated-29m2-o-29-pv-ctc_cluster-gsea-dotplot-simplified, fig.width = 2.2, fig.asp=0.68}
+x %>% 
+  group_by(group, .sign) %>% 
+  summarise(NES = mean(NES), log10P = mean(log10P)) %>% 
+  ungroup() %>%
+  ggplot(aes(x = NES, y = group, size = log10P, color = NES)) +
+  facet_grid(rows = vars(.sign), scales = 'free_y', space = 'free_y') +
+  geom_point(pch = 19) +
+  scale_y_discrete(labels =  default_labeller(80)) +
+  geom_vline(xintercept = 0, lty = 3) +
+  labs(
+    x = 'Average\nNES',
+    y = '',
+    color = 'Average NES',
+    size = expression(paste("Mean\n", "-lo", g[10],"(Adjusted P value)"))
+  ) +
+  scale_size_continuous(range=c(0.8, 2)) +
+  scale_color_gradient2(trans = "reverse") +
+  scale_x_continuous(expand = expansion(mult = c(0.20, 0.20)),
+                     limits = xlim) +
+  theme(
+    panel.border = element_rect(color = "black", fill = NA, linewidth = linewidth_default),
+    # strip.text.y = element_text(angle = 0, hjust = 0),
+    strip.text.y = element_blank(),
+    axis.line = element_blank(),
+    axis.ticks = element_line(color = "black", linewidth = linewidth_default),
+    axis.text.y = element_text(size = 4),
+    axis.text.x = element_text(size = 4),
+    
+    legend.text = element_text(size = 4), 
+    legend.title = element_text(size = 4),
+    legend.key.width = unit(0.2, "cm")
+  )
+
+```
+

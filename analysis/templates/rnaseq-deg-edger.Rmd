@@ -46,10 +46,6 @@ if(exists('comp_list_description')) {
 }
 ```
 
-The tables of results can be downloaded using the following links:
-
-- [**Differential gene expression**](`r gsub("docs/", "" , dge_file_xlsx)`)
-
 ### Download results
 
 - [**Differential gene expression**](`r gsub("docs/", "" , dge_file_xlsx)`)

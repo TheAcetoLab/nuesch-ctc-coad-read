@@ -1,11 +1,23 @@
 ---
-title: "Home"
+title: "CTC profiling in COAD and READ"
 site: workflowr::wflow_site
 output:
-  workflowr::wflow_html:
-    toc: false
+  workflowr::wflow_html
 editor_options:
   chunk_output_type: console
 ---
 
-Welcome to my research website.
+
+## HT29 and HT29_Li.M2 xenograft models
+
+- [Exploratory analysis](xenograft-rnaseq-exploratory.html)
+- [Differential expression](xenograft-rnaseq-deg-donor.html)
+
+## HT29_Li.M2
+
+- [Exploratory analysis](HT29_Li.M2-rnaseq-exploratory.html)
+
+## Patient
+
+- [Exploratory analysis](patient_tx031-rnaseq-exploratory.html)
+

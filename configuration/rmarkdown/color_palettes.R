@@ -51,7 +51,6 @@ get_palette <- function(palette_name) {
          condition = c(intact = '#8a8b86', castrated = '#F26C64', Intact = '#8a8b86', Castrated = '#F26C64'),
          cc_phase = c(G1 = '#CC79A7', G2M = '#D55E00', S = '#F0E442', G1S = '#E9C39B'),
          cc_phase_cy = c(G1 = '#CC79A7', G2M = '#D55E00', S = '#F0E442', G1S = '#E9C39B'),
-         cc_phase_seu = c(G1 = '#CC79A7', G2M = '#D55E00', S = '#F0E442', G1S = '#E9C39B'),
          sample_type = c(
            ctc_cluster = '#CC79A7',
            `CTC cluster` = '#CC79A7',
@@ -73,19 +72,13 @@ get_palette <- function(palette_name) {
            inferior_vena_cava_posthepatic = '#6BA3D6'
          ),
          anatomical_origin_grouped = c(
-           post_liver = '#56B4E9',
-           pre_liver = '#E69F00'
+           post_liver = '#802023',
+           pre_liver = '#0a0b07'
          ),
          donor = c(
-           HCT116 = '#2596be',
            HT29 = '#ACD98D',
            `HT29_Li.M2` = '#b15994'
          ),
-         # cluster = c(
-         #   `1` = "#83AF9B",
-         #   `2` = "#fe8ca1",
-         #   `3` = "#f8da8a"
-         # ),
          cluster = c(
            `1` = "grey20",
            `2` = "grey50",
@@ -95,6 +88,10 @@ get_palette <- function(palette_name) {
            `1` = "grey20",
            `2` = "grey50",
            `3` = "grey80"
+         ),
+         uclust = c(
+           `1` = "#E69F00",
+           `2` = "#56B4E9"
          )
   )
 }
