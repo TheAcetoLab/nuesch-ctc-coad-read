@@ -8,8 +8,7 @@ knitr::opts_knit$set(
 
 ```{r set-gsea-collections}
 ora_collections <- list(
-  enricher = names(gmt_files_symbols),
-  enrichGO = c("BP", "MF")
+  enricher = names(gmt_files_symbols)
 )
 
 ```

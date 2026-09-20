@@ -814,6 +814,26 @@ use_data %>%
 ```
 
 
+### Score correlation
+```{r x-HT29_Li.M2-integration-corrplot, fig.width=10.35, fig.asp=1.2}
+x <- t(gsva_res)
+colnames(x) <- clean_msigdb_names(colnames(x))
+colnames(x) <- gsub("^(.{10}[^ ]*)\\s", "\\1\n", colnames(x))
+chart.Correlation(x)
+```
+
+### Network correlation
+```{r x-HT29_Li.M2-integration-network, fig.width=10}
+# Make a correlation matrix:
+mat <- cor(x)
+# Keep only high correlations
+mat[mat<0.4] <- 0
+# Make an Igraph object from this matrix:
+network <- graph_from_adjacency_matrix( mat, weighted=T, mode="undirected", diag=F)
+# Basic chart
+plot(network)
+```
+
 
 ### Heatmap
 ```{r x-HT29_Li.M2-integration-heatmap-cluster, fig.width=7.1}
